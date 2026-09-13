@@ -636,7 +636,7 @@ export async function runConsolidationPipeline(
 
 // ── Observer stage (with fallback) ──────────────────────────────────────────
 
-async function runObserverStage(
+export async function runObserverStage(
   pi: ExtensionAPI,
   runtime: Runtime,
   ctx: ConsolidationCtx,
@@ -669,7 +669,9 @@ async function runObserverStage(
     effectiveStart = lastCoverageIdx >= 0 ? lastCoverageIdx : findLastCompactionIndex(entries);
   }
 
-  const tokens = effectiveStart >= 0 ? rawTokensAfterIndex(entries, effectiveStart) : 0;
+  // Anchor -1 (no cursor, no marker, no compaction) measures the full history:
+  // rawTokensAfterIndex clamps -1 to index 0 (issue #87).
+  const tokens = rawTokensAfterIndex(entries, effectiveStart);
   if (tokens < runtime.config.observeAfterTokens) {
     // Not due — advance cursor to last source entry so we don't re-check immediately
     const lastSourceId = [...entries].reverse().find((e: Entry) => isSourceEntry(e))?.id;

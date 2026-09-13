@@ -2,6 +2,12 @@
 
 ---
 
+### Fixed
+
+- **Observer now records on sessions that have never compacted.** The observer stage's progress anchor (cursor → observation coverage marker → last compaction entry) zeroed its accumulated-token count when all three were absent — every fresh session, fork, or subagent below the compaction threshold measured 0 tokens and stayed `not_due` forever, while the status line (`anyStageDue`) correctly counted the full history and kept reporting the observer as due. The anchor now falls through to the full-history measurement (`rawTokensAfterIndex` already clamps an index of -1 to index 0), so the observer fires once `observeAfterTokens` accumulate even with no compaction entry in the branch. Sessions with any anchor (compacted, marker-bearing, cursor-bearing) behave identically. Regression from the v0.3.8 cursor work (#28/#29); behavior matches what the trigger path already did. ([#87](https://github.com/k0valik/pi-blackhole/issues/87))
+
+---
+
 ## [0.5.3] - 2026-09-10
 
 ### Fixed
