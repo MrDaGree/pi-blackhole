@@ -1,9 +1,17 @@
 ## [Unreleased]
 
+---
+
+## [0.5.4] - 2026-09-13
+
 ### Fixed
 
 - **Skip ineligible proactive auto-compaction before core `prepareCompaction` failure.** When provider context reaches the auto-compaction threshold (e.g. via large system prompts, tool definitions, or memory projections) but available session entries after the latest boundary remain below Pi's configured `keepRecentTokens` budget (default 20,000), `prepareCompaction()` returns `undefined`, which previously caused Pi's `AgentSession.compact()` to throw `"Nothing to compact (session too small)"` before extension hooks ran. Settled (`agent_end`) and mid-run (`turn_end` in resume and pause modes) auto-compaction now evaluate session eligibility using Pi's `prepareCompaction` and the captured `AgentSession`'s effective compaction settings, suppressing premature trigger notices, inline failure backoff loops, and unhandled compaction errors while cleanly resuming once session history grows past the keep budget.
 - **Observer now records on sessions that have never compacted.** The observer stage's progress anchor (cursor → observation coverage marker → last compaction entry) zeroed its accumulated-token count when all three were absent — every fresh session, fork, or subagent below the compaction threshold measured 0 tokens and stayed `not_due` forever, while the status line (`anyStageDue`) correctly counted the full history and kept reporting the observer as due. The anchor now falls through to the full-history measurement (`rawTokensAfterIndex` already clamps an index of -1 to index 0), so the observer fires once `observeAfterTokens` accumulate even with no compaction entry in the branch. Sessions with any anchor (compacted, marker-bearing, cursor-bearing) behave identically. Regression from the v0.3.8 cursor work (#28/#29); behavior matches what the trigger path already did. ([#87](https://github.com/k0valik/pi-blackhole/issues/87))
+
+### Dependencies
+
+- Bumped the dev-dependencies group with 9 updates ([#88](https://github.com/k0valik/pi-blackhole/pull/88)). Dependabot now applies a cooldown (2 days default, 7 days for semver-major) so it only opens PRs carrying packages past the 48h `minimumReleaseAge` maturity gate instead of producing lockfiles `pnpm install` rejects.
 
 ---
 
