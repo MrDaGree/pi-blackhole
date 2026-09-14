@@ -5,7 +5,10 @@
  * Every sibling module of `index.ts` is mocked so this stays a wiring test —
  * no Pi host, no config file, no network.
  */
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createExtensionApiDouble } from "./fixtures/pi-extension-api.js";
 
 const installMock = vi.fn();
 const registerCompactionTriggerMock = vi.fn();
@@ -33,8 +36,8 @@ vi.mock("../src/om/runtime", () => ({
   },
 }));
 
-function createPiMock() {
-  return { on: vi.fn(), sendMessage: vi.fn() };
+function createPiMock(): ExtensionAPI {
+  return createExtensionApiDouble();
 }
 
 describe("extension factory wiring", () => {
@@ -56,10 +59,9 @@ describe("extension factory wiring", () => {
         registeredStatus = runtime.inlineCompactionAdapterStatus;
       },
     );
-
     const { default: factory } = await import("../index");
     let settled = false;
-    const run = factory(createPiMock() as never).then(() => {
+    const run = factory(createPiMock()).then(() => {
       settled = true;
     });
     await Promise.resolve();

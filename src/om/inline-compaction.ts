@@ -96,6 +96,8 @@ interface SessionRecord {
   session: PatchableSession;
   originalCompact: PatchableSession["compact"];
   shape: CompactShape;
+  /** Installation that produced this record, used to detect no-op rebinds. */
+  install: InstalledAdapter;
   hostBinding?: HostPrepareBinding;
 }
 
@@ -402,9 +404,17 @@ function registerSession(
   }
 
   const previous = registry.sessions.get(session.sessionManager);
-  if (previous?.hostBinding) {
-    // The innermost patch already bound this session to its own host. A broader
-    // (usually inherited) patch must not replace that host binding.
+  if (
+    previous &&
+    previous.session === session &&
+    previous.install !== installed &&
+    previous.hostBinding
+  ) {
+    // A broader (usually inherited) patch rebound the same session after the
+    // innermost patch already bound it to its own host: keep that host binding.
+    // A different session using this manager, or a rebind by the same
+    // installation (e.g. after the host helper was refreshed), falls through and
+    // replaces the record.
     installNextTurnRefresh(session, registry);
     return;
   }
@@ -416,6 +426,7 @@ function registerSession(
     session,
     originalCompact: installed.originalCompact,
     shape: installed.shape,
+    install: installed,
     hostBinding: installed.hostBinding,
   });
   installNextTurnRefresh(session, registry);
@@ -920,8 +931,14 @@ export function getCapturedCompactionSettings(
   return undefined;
 }
 
-export function getPrepareCompactionStatus(): PrepareCompactionStatus {
+export function getPrepareCompactionStatus(sessionManager?: object): PrepareCompactionStatus {
   const registry = getRegistry();
+  const binding = sessionManager ? registry.sessions.get(sessionManager)?.hostBinding : undefined;
+  if (binding) {
+    // Host-bound session: report that host's own helper, not whichever host the
+    // shared registry resolved first.
+    return { resolved: typeof binding.prepareCompaction === "function" };
+  }
   return {
     resolved: typeof registry.prepareCompaction === "function",
     source: registry.prepareCompactionSource,

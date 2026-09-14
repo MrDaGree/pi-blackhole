@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Context } from "@earendil-works/pi-ai/compat";
+import type { CompactionEntry, CompactionResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 
@@ -20,6 +21,8 @@ import {
   parseHostFramePaths,
 } from "../src/om/inline-compaction.js";
 import { createPiAgentSessionHarness } from "./fixtures/pi-agent-session.js";
+import { createExtensionApiDouble } from "./fixtures/pi-extension-api.js";
+import { Runtime } from "../src/om/runtime.js";
 import { registerCompactionTrigger } from "../src/om/compaction-trigger.js";
 
 interface FakeTurnContext {
@@ -218,19 +221,20 @@ interface HostFixture {
 async function makeHostFixture(
   fixtureRoot: string,
   name: string,
-  options: { eligibleForCompaction: boolean },
+  options: { eligibleForCompaction: boolean } | { prepareSource: string },
 ): Promise<HostFixture> {
   const packageRoot = join(fixtureRoot, name, "node_modules", "@earendil-works", "pi-coding-agent");
   const dist = join(packageRoot, "dist");
   await mkdir(join(dist, "core", "compaction"), { recursive: true });
   await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
   await writeFile(join(dist, "index.js"), hostSessionSource(`${name}-summary`));
-  await writeFile(
-    join(dist, "core", "compaction", "index.js"),
-    options.eligibleForCompaction
-      ? 'export function prepareCompaction(entries) { return { firstKeptEntryId: entries[0]?.id ?? "entry-1" }; }\n'
-      : "export function prepareCompaction() { return undefined; }\n",
-  );
+  const prepareSource =
+    "prepareSource" in options
+      ? options.prepareSource
+      : options.eligibleForCompaction
+        ? 'export function prepareCompaction(entries) { return { firstKeptEntryId: entries[0]?.id ?? "entry-1" }; }\n'
+        : "export function prepareCompaction() { return undefined; }\n";
+  await writeFile(join(dist, "core", "compaction", "index.js"), prepareSource);
   const cli = join(dist, "cli.js");
   const frame = join(dist, "frame.js");
   await Promise.all([writeFile(cli, ""), writeFile(frame, "")]);
@@ -241,6 +245,50 @@ interface FixtureSessionClass {
   new (): {
     _bindExtensionCore(runner: unknown): void;
     sessionManager: object;
+  };
+}
+
+/**
+ * Synthetic session whose `compact()` reports its own label. Instances take an
+ * explicit manager so tests can model Pi reusing one manager for a replacement
+ * session and re-installing an adapter across a reload.
+ */
+function createSharedManagerSessionClass() {
+  return class SharedManagerSession {
+    agent = { state: { messages: [] as unknown[] } };
+    _compactionAbortController: AbortController | undefined;
+    settingsManager = {
+      getCompactionSettings: () => ({
+        enabled: true,
+        reserveTokens: 1000,
+        keepRecentTokens: 20_000,
+      }),
+    };
+    sessionManager: {
+      buildSessionContext(): { messages: unknown[] };
+      appendCompaction(): void;
+    };
+
+    constructor(label: string, sessionManager: SharedManagerSession["sessionManager"]) {
+      this.label = label;
+      this.sessionManager = sessionManager;
+    }
+
+    label: string;
+
+    async abort(): Promise<void> {}
+
+    _bindExtensionCore(runner: unknown): void {
+      void runner;
+    }
+
+    async compact(): Promise<CompactionResult> {
+      await this.abort();
+      this._compactionAbortController = new AbortController();
+      this.sessionManager.appendCompaction();
+      this.agent.state.messages = [];
+      return { summary: this.label, firstKeptEntryId: "kept", tokensBefore: 1 };
+    }
   };
 }
 
@@ -728,13 +776,18 @@ describe("Blackhole inline compaction adapter", () => {
     const packageRoot = join(fixtureRoot, "node_modules", "@earendil-works", "pi-coding-agent");
     const dist = join(packageRoot, "dist");
     const chunks = join(dist, "bundle", "chunks");
+    const barrelMarker = join(fixtureRoot, "barrel-imported.marker");
     try {
       await mkdir(chunks, { recursive: true });
       await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
-      // A throwing barrel proves the fast path never pays the barrel import.
+      // An observable import sentinel plus a throwing body: the marker proves
+      // the fast path never loaded this module, and the throw makes the failure
+      // loud if a future change does load it.
       await writeFile(
         join(dist, "index.js"),
-        'throw new Error("dist barrel must not be imported");\n',
+        `import { writeFileSync } from "node:fs";\n` +
+          `writeFileSync(${JSON.stringify(barrelMarker)}, "imported");\n` +
+          'throw new Error("dist barrel must not be imported");\n',
       );
       await writeFile(
         join(chunks, "runtime.js"),
@@ -748,6 +801,49 @@ describe("Blackhole inline compaction adapter", () => {
       await expect(
         installHostInlineCompactionAdapter({ entrypoint: join(dist, "cli.js"), stack: "" }),
       ).resolves.toEqual({ supported: true });
+      expect(existsSync(barrelMarker)).toBe(false);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "throws on import",
+      'export function main() {}\nthrow new Error("fast candidate failed to load");\n',
+    ],
+    ["exports no AgentSession", "export function main() {}\n"],
+  ])("falls back to the root barrel when the fast candidate %s", async (_kind, fastSource) => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-fast-rejected-"));
+    const packageRoot = join(fixtureRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+    const dist = join(packageRoot, "dist");
+    const chunks = join(dist, "bundle", "chunks");
+    try {
+      await mkdir(chunks, { recursive: true });
+      await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
+      // The fast candidate resolves but is rejected, so the root's modular
+      // barrel must still be tried and must be the one that patches the session
+      // used for compaction.
+      await writeFile(join(chunks, "runtime.js"), fastSource);
+      await writeFile(join(dist, "index.js"), `${hostSessionSource("barrel-after-rejection")}\n`);
+      await writeFile(
+        join(dist, "cli.js"),
+        '#!/usr/bin/env node\nimport { main } from "./bundle/chunks/runtime.js";\nvoid main();\n',
+      );
+
+      const barrel = (await import(pathToFileURL(join(dist, "index.js")).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+
+      await expect(
+        installHostInlineCompactionAdapter({ entrypoint: join(dist, "cli.js"), stack: "" }),
+      ).resolves.toEqual({ supported: true });
+
+      const session = new barrel.AgentSession();
+      session._bindExtensionCore({});
+      await expect(compactInlineAtTurnBoundary(session.sessionManager)).resolves.toMatchObject({
+        summary: "barrel-after-rejection",
+      });
     } finally {
       await rm(fixtureRoot, { recursive: true, force: true });
     }
@@ -930,6 +1026,126 @@ describe("Blackhole inline compaction adapter", () => {
 
     expect(status.supported).toBe(false);
     expect(status.reason).toContain("host AgentSession module");
+  });
+
+  it("uses the owning host helper with the supplied compaction settings", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-host-settings-"));
+    try {
+      const gated = await makeHostFixture(fixtureRoot, "gated", {
+        prepareSource:
+          "export function prepareCompaction(entries, settings) {\n" +
+          "  if (!settings || settings.enabled === false) return undefined;\n" +
+          '  return { firstKeptEntryId: entries[0]?.id ?? "entry-1" };\n' +
+          "}\n",
+      });
+      const none = await makeHostFixture(fixtureRoot, "none", {
+        prepareSource: "export function prepareCompaction() { return undefined; }\n",
+      });
+      const gatedModule = (await import(pathToFileURL(gated.barrel).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+      const noneModule = (await import(pathToFileURL(none.barrel).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+
+      await expect(
+        installHostInlineCompactionAdapter({
+          entrypoint: none.cli,
+          stack: `Error\n    at first (${gated.frame}:1:1)`,
+        }),
+      ).resolves.toEqual({ supported: true });
+
+      const gatedSession = new gatedModule.AgentSession();
+      gatedSession._bindExtensionCore({});
+      const noneSession = new noneModule.AgentSession();
+      noneSession._bindExtensionCore({});
+
+      const enabled = { enabled: true, reserveTokens: 1000, keepRecentTokens: 20_000 };
+      const disabled = { enabled: false, reserveTokens: 1000, keepRecentTokens: 20_000 };
+      // Same run supplies both settings values: only the owning host's helper
+      // decides, and it must receive the caller's settings unchanged.
+      expect(isCompactionEligible(gatedSession.sessionManager, [], enabled)).toBe(true);
+      expect(isCompactionEligible(gatedSession.sessionManager, [], disabled)).toBe(false);
+      expect(isCompactionEligible(noneSession.sessionManager, [], enabled)).toBe(false);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("compacts the replacement session that reuses a captured session manager", async () => {
+    const SharedManagerSession = createSharedManagerSessionClass();
+    const manager = {
+      buildSessionContext: () => ({ messages: [] as unknown[] }),
+      appendCompaction: vi.fn(),
+    };
+    expect(
+      installInlineCompactionAdapter({
+        sessionClass: SharedManagerSession,
+        hostPrepareCompaction: () => ({}),
+      }),
+    ).toEqual({ supported: true });
+
+    new SharedManagerSession("previous", manager)._bindExtensionCore({});
+    new SharedManagerSession("replacement", manager)._bindExtensionCore({});
+
+    await expect(compactInlineAtTurnBoundary(manager)).resolves.toMatchObject({
+      summary: "replacement",
+    });
+  });
+
+  it("uses the refreshed host helper after the adapter is reinstalled", async () => {
+    const RefreshableSession = createSharedManagerSessionClass();
+    const manager = {
+      buildSessionContext: () => ({ messages: [] as unknown[] }),
+      appendCompaction: vi.fn(),
+    };
+    installInlineCompactionAdapter({
+      sessionClass: RefreshableSession,
+      hostPrepareCompaction: () => undefined,
+    });
+    const session = new RefreshableSession("reloaded", manager);
+    session._bindExtensionCore({});
+
+    expect(isCompactionEligible(manager, [])).toBe(false);
+
+    // A reload re-installs the adapter with the host's current helper.
+    installInlineCompactionAdapter({
+      sessionClass: RefreshableSession,
+      hostPrepareCompaction: () => ({ firstKeptEntryId: "kept" }),
+    });
+    session._bindExtensionCore({});
+
+    expect(isCompactionEligible(manager, [])).toBe(true);
+  });
+
+  it("reports preparation capability from the session's own host", async () => {
+    const WithHelper = createSharedManagerSessionClass();
+    const WithoutHelper = createSharedManagerSessionClass();
+    const withHelperManager = {
+      buildSessionContext: () => ({ messages: [] as unknown[] }),
+      appendCompaction: vi.fn(),
+    };
+    const withoutHelperManager = {
+      buildSessionContext: () => ({ messages: [] as unknown[] }),
+      appendCompaction: vi.fn(),
+    };
+    installInlineCompactionAdapter({
+      sessionClass: WithHelper,
+      hostPrepareCompaction: () => ({ firstKeptEntryId: "kept" }),
+    });
+    installInlineCompactionAdapter({
+      sessionClass: WithoutHelper,
+      hostPrepareCompaction: undefined,
+    });
+
+    new WithHelper("with-helper", withHelperManager)._bindExtensionCore({});
+    new WithoutHelper("without-helper", withoutHelperManager)._bindExtensionCore({});
+
+    expect(getPrepareCompactionStatus(withHelperManager)).toEqual({ resolved: true });
+    expect(getPrepareCompactionStatus(withoutHelperManager)).toEqual({ resolved: false });
+    // The shared registry entry still describes whichever host resolved first;
+    // it must not stand in for a host that exposes no helper of its own.
+    expect(getPrepareCompactionStatus().resolved).toBe(true);
   });
 
   it("recognizes the installed Pi compact implementation", () => {
@@ -1233,48 +1449,51 @@ describe("Blackhole inline compaction adapter", () => {
     ).resolves.toEqual({ supported: true });
   });
 
-  it("compacts through the registered turn_end trigger before the next provider request", async () => {
-    // Eligibility is injected so this test exercises the trigger → adapter →
-    // provider path rather than the host's prepareCompaction resolver.
-    installInlineCompactionAdapter({
-      prepareCompaction: () => ({ firstKeptEntryId: "entry-1" }),
-    });
+  interface TurnEndScenarioOptions {
+    /** Mirrors extension startup: installs the adapter before any session exists. */
+    install: () => void | Promise<void>;
+    compactAfterTokens?: number;
+  }
 
-    const handlers = new Map<string, (...args: any[]) => unknown>();
-    const runtime = {
-      ensureConfig: vi.fn(),
-      resetInfoGate: vi.fn(),
-      tryEmitInfo: vi.fn(),
-      config: {
-        compaction: "auto",
-        compactionEngine: "blackhole",
-        passive: false,
-        noAutoCompact: false,
-        overrideDefaultCompaction: true,
-        memory: true,
-        midRunCompaction: "resume",
-        compactAfterTokens: 1,
-      },
-      compactInFlight: false,
-      autoCompactionController: null as AbortController | null,
-      midRunCompactionRetry: { failures: 0, retryAfter: 0 },
-      inlineCompactionAdapterStatus: undefined as
-        | { supported: boolean; reason?: string }
-        | undefined,
-      inlineCompactionWarningEmitted: false,
-      debugLog: false,
+  /**
+   * Drives one real AgentSession run through the registered turn_end trigger:
+   * an active tool turn crosses the threshold, compaction must complete before
+   * the next provider request and must not abort the run.
+   */
+  async function runTurnEndCompactionScenario(options: TurnEndScenarioOptions): Promise<void> {
+    await options.install();
+
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const runtime = new Runtime();
+    runtime.config = {
+      ...runtime.config,
+      compaction: "auto",
+      compactionEngine: "blackhole",
+      passive: false,
+      noAutoCompact: false,
+      overrideDefaultCompaction: true,
+      memory: true,
+      midRunCompaction: "resume",
+      compactAfterTokens: options.compactAfterTokens ?? 1,
     };
+    runtime.ensureConfig = vi.fn();
+    runtime.resetInfoGate = vi.fn();
+    runtime.tryEmitInfo = vi.fn();
+    runtime.compactInFlight = false;
+    runtime.autoCompactionController = null;
+    runtime.midRunCompactionRetry = { failures: 0, retryAfter: 0 };
+    runtime.inlineCompactionAdapterStatus = undefined;
+    runtime.inlineCompactionWarningEmitted = false;
+
     registerCompactionTrigger(
-      {
-        on: (name: string, cb: (...args: any[]) => unknown) => {
-          handlers.set(name, cb);
-        },
-      } as never,
-      runtime as never,
+      createExtensionApiDouble({ handlers }),
+      runtime,
       compactInlineAtTurnBoundary,
     );
     const turnEndHandler = handlers.get("turn_end");
-    expect(turnEndHandler).toBeTypeOf("function");
+    if (typeof turnEndHandler !== "function") {
+      throw new Error("registerCompactionTrigger did not register a turn_end handler");
+    }
 
     const summaryStarted = createDeferred();
     const releaseSummary = createDeferred();
@@ -1337,7 +1556,7 @@ describe("Blackhole inline compaction adapter", () => {
         },
       ]);
 
-      const savedCompactions: unknown[] = [];
+      const savedCompactions: CompactionResult[] = [];
       harness.session.subscribe((event) => {
         if (event.type === "compaction_end" && event.result) savedCompactions.push(event.result);
       });
@@ -1348,7 +1567,7 @@ describe("Blackhole inline compaction adapter", () => {
         if (event.type !== "turn_end") return;
         activeRunSignal = signal;
         try {
-          await turnEndHandler!(event, {
+          await turnEndHandler(event, {
             cwd: process.cwd(),
             sessionManager: harness.sessionManager,
             hasUI: false,
@@ -1395,6 +1614,17 @@ describe("Blackhole inline compaction adapter", () => {
       expect(runtime.compactInFlight).toBe(false);
       expect(savedCompactions).toHaveLength(1);
 
+      // Persisted identity: one compaction entry exists in the branch, and the
+      // context Pi keeps after it starts at the entry it retained.
+      const persistedCompactions = harness.sessionManager
+        .getBranch()
+        .filter((entry): entry is CompactionEntry => entry.type === "compaction");
+      expect(persistedCompactions).toHaveLength(1);
+      expect(persistedCompactions[0]?.summary).toBe(savedCompactions[0]?.summary);
+      expect(harness.sessionManager.getBranch().map((entry) => entry.id)).toContain(
+        persistedCompactions[0]?.firstKeptEntryId,
+      );
+
       const compactedMessages = harness.sessionManager.buildSessionContext().messages;
       expect(nextRequestMessages).toEqual(convertToLlm(compactedMessages));
       expect(JSON.stringify(nextRequestMessages)).toContain("COMPACTED-SUMMARY");
@@ -1417,5 +1647,54 @@ describe("Blackhole inline compaction adapter", () => {
       await promptPromise?.catch(() => undefined);
       harness.cleanup();
     }
+  }
+
+  describe("turn_end compaction through a live agent run", () => {
+    it("compacts with an injected host helper before the next provider request", async () => {
+      // Eligibility is injected so this test exercises the trigger → adapter →
+      // provider path rather than the host's prepareCompaction resolver.
+      await runTurnEndCompactionScenario({
+        install: () => {
+          installInlineCompactionAdapter({
+            prepareCompaction: () => ({ firstKeptEntryId: "entry-1" }),
+          });
+        },
+      });
+    });
+
+    it("compacts when a discovered host layout supplies the AgentSession class", async () => {
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-discovery-loop-"));
+      const packageRoot = join(fixtureRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+      const dist = join(packageRoot, "dist");
+      try {
+        await mkdir(dist, { recursive: true });
+        await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
+        // The barrel re-exports the installed host's session class, so discovery
+        // patches the same prototype the provider-loop harness instantiates.
+        const hostBarrel = join(
+          process.cwd(),
+          "node_modules",
+          "@earendil-works",
+          "pi-coding-agent",
+          "dist",
+          "index.js",
+        );
+        await writeFile(
+          join(dist, "index.js"),
+          `export { AgentSession } from ${JSON.stringify(pathToFileURL(hostBarrel).href)};\n`,
+        );
+        await writeFile(join(dist, "cli.js"), "");
+
+        await runTurnEndCompactionScenario({
+          install: async () => {
+            await expect(
+              installHostInlineCompactionAdapter({ entrypoint: join(dist, "cli.js"), stack: "" }),
+            ).resolves.toEqual({ supported: true });
+          },
+        });
+      } finally {
+        await rm(fixtureRoot, { recursive: true, force: true });
+      }
+    });
   });
 });
