@@ -657,25 +657,32 @@ export async function runObserverStage(
     throw error;
   }
 
-  // Determine start index: cursor takes priority, fall back to coverage markers
+  // Determine start index: cursor takes priority. A cursor whose entry left the
+  // branch (fork, navigation, compaction during the session) falls back to the
+  // same marker/compaction rule as an absent cursor, so a pruned pre-compaction
+  // anchor never forces a full-history re-observation.
   const observerCursor = runtime.getCursor("observer");
+  const observerFallbackStart = (): number => {
+    const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+    return lastCoverageIdx >= 0 ? lastCoverageIdx : findLastCompactionIndex(entries);
+  };
   let effectiveStart: number;
   if (observerCursor) {
     const cursorIdx = entryIndexForId(entries, observerCursor.entryId);
-    effectiveStart =
-      cursorIdx >= 0 ? cursorIdx : latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+    effectiveStart = cursorIdx >= 0 ? cursorIdx : observerFallbackStart();
   } else {
-    const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
-    effectiveStart = lastCoverageIdx >= 0 ? lastCoverageIdx : findLastCompactionIndex(entries);
+    effectiveStart = observerFallbackStart();
   }
 
   // Anchor -1 (no cursor, no marker, no compaction) measures the full history:
   // rawTokensAfterIndex clamps -1 to index 0 (issue #87).
   const tokens = rawTokensAfterIndex(entries, effectiveStart);
   if (tokens < runtime.config.observeAfterTokens) {
-    // Not due — advance cursor to last source entry so we don't re-check immediately
-    const lastSourceId = [...entries].reverse().find((e: Entry) => isSourceEntry(e))?.id;
-    if (lastSourceId) runtime.advanceCursor("observer", lastSourceId, "not_due");
+    // Not due. Keep the anchor at the measured coverage point rather than the
+    // newest entry: below-threshold content is still unobserved, so moving the
+    // cursor past it would drop it permanently instead of letting it accumulate.
+    const anchorId = effectiveStart >= 0 ? entries[effectiveStart]?.id : undefined;
+    if (anchorId) runtime.advanceCursor("observer", anchorId, "not_due");
     return "continue";
   }
 

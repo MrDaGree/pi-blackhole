@@ -9,6 +9,7 @@
  *   - Skipped "does not await observer/reflect promises" test (not applicable)
  */
 import { join } from "node:path";
+import type { CompactionResult } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -1025,6 +1026,58 @@ describe("inline adapter classification", () => {
     ok.startHandler(undefined, fakeCtx([belowBranch]));
     expect(ok.runtime.config.midRunCompaction).toBe("resume");
   });
+  it("loads config at agent_start before deciding on the resume warning", () => {
+    const { startHandler, runtime } = captureHandler({});
+    // First run: no config loaded yet — only ensureConfig can supply the mode.
+    runtime.config.midRunCompaction = undefined;
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    runtime.ensureConfig = vi.fn((cwd: string) => {
+      expect(cwd).toBe("/tmp/project");
+      runtime.config.midRunCompaction = "resume";
+    });
+    const ctx = fakeCtx([belowBranch]);
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.ensureConfig).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify.mock.calls[0][0]).toContain("pi lacks API");
+    expect(ctx.ui.notify.mock.calls[0][1]).toBe("warning");
+  });
+
+  it("stays silent at agent_start when the loaded config is not resume", () => {
+    const { startHandler, runtime } = captureHandler({});
+    runtime.config.midRunCompaction = undefined;
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    runtime.ensureConfig = vi.fn(() => {
+      runtime.config.midRunCompaction = "pause";
+    });
+    const ctx = fakeCtx([belowBranch]);
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.ensureConfig).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("marks the warning emitted without notifying when the ctx has no UI", () => {
+    const { startHandler, runtime } = captureHandler({ midRunCompaction: "resume" });
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    const ctx = fakeCtx([belowBranch], { hasUI: false, ui: undefined });
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.inlineCompactionWarningEmitted).toBe(true);
+  });
 });
 
 describe("Context-window-derived threshold (issue #60)", () => {
@@ -1197,6 +1250,7 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
       buildSessionContext: () => { messages: unknown[] };
       getBranch: () => TestEntry[];
       getSessionId: () => string;
+      appendCompaction?: () => void;
     };
     agent = { state: { messages: [] } };
 
@@ -1218,10 +1272,11 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
       };
     }
 
-    async compact() {
+    async compact(): Promise<CompactionResult> {
       await this.abort();
-      (this as any).sessionManager.appendCompaction?.();
+      this.sessionManager.appendCompaction?.();
       this.agent.state.messages = [];
+      return { summary: "trigger-test-summary", firstKeptEntryId: "kept-1", tokensBefore: 1 };
     }
 
     async abort() {}
@@ -1412,5 +1467,139 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
     await flushAll();
 
     expect(ctx.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a session whose own host helper reports ineligible while another host is eligible", async () => {
+    class IneligibleHostSession extends TriggerTestSession {}
+    class EligibleHostSession extends TriggerTestSession {}
+    const ineligiblePrepare = vi.fn(() => undefined);
+    const eligiblePrepare = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    installInlineCompactionAdapter({
+      sessionClass: IneligibleHostSession,
+      hostPrepareCompaction: ineligiblePrepare,
+    });
+    installInlineCompactionAdapter({
+      sessionClass: EligibleHostSession,
+      hostPrepareCompaction: eligiblePrepare,
+    });
+
+    const eligibleSession = new EligibleHostSession(() => makeLargeBranch(), {});
+    eligibleSession._bindExtensionCore({});
+    const ineligibleSession = new IneligibleHostSession(() => makeLargeBranch(), {});
+    ineligibleSession._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: ineligibleSession.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    await flushAll();
+
+    expect(ctx.compact).not.toHaveBeenCalled();
+    expect(runtime.compactInFlight).toBe(false);
+    expect(ineligiblePrepare).toHaveBeenCalledTimes(1);
+    expect(eligiblePrepare).not.toHaveBeenCalled();
+  });
+
+  it("compacts a session whose own host helper reports eligible", async () => {
+    class IneligibleHostSession extends TriggerTestSession {}
+    class EligibleHostSession extends TriggerTestSession {}
+    const ineligiblePrepare = vi.fn(() => undefined);
+    const eligiblePrepare = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    installInlineCompactionAdapter({
+      sessionClass: IneligibleHostSession,
+      hostPrepareCompaction: ineligiblePrepare,
+    });
+    installInlineCompactionAdapter({
+      sessionClass: EligibleHostSession,
+      hostPrepareCompaction: eligiblePrepare,
+    });
+
+    const eligibleSession = new EligibleHostSession(() => makeLargeBranch(), {});
+    eligibleSession._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: eligibleSession.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    expect(runtime.compactInFlight).toBe(true);
+    await flushAll();
+
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(eligiblePrepare).toHaveBeenCalled();
+    expect(ineligiblePrepare).not.toHaveBeenCalled();
+  });
+
+  it("compacts for a replacement session that reuses the previous session manager", async () => {
+    class ReusedManagerSession extends TriggerTestSession {}
+    const ineligibleReplace = vi.fn(() => undefined);
+    const eligibleReplace = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    // Both installs target one class: the replacement session shares its
+    // manager with the previous session, exactly like a resumed Pi session.
+    installInlineCompactionAdapter({
+      sessionClass: ReusedManagerSession,
+      hostPrepareCompaction: ineligibleReplace,
+    });
+    const previous = new ReusedManagerSession(() => makeLargeBranch(), {});
+    previous._bindExtensionCore({});
+    const replacement = new ReusedManagerSession(() => makeLargeBranch(), {});
+    replacement.sessionManager = previous.sessionManager;
+    replacement._bindExtensionCore({});
+
+    installInlineCompactionAdapter({
+      sessionClass: ReusedManagerSession,
+      hostPrepareCompaction: eligibleReplace,
+    });
+    replacement._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: replacement.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    expect(runtime.compactInFlight).toBe(true);
+    await flushAll();
+
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(eligibleReplace).toHaveBeenCalled();
+    expect(ineligibleReplace).not.toHaveBeenCalled();
+  });
+
+  it("skips a replacement session whose refreshed host helper reports ineligible", async () => {
+    class RefreshedHostSession extends TriggerTestSession {}
+    const eligibleInitially = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+    const refreshedIneligible = vi.fn(() => undefined);
+
+    installInlineCompactionAdapter({
+      sessionClass: RefreshedHostSession,
+      hostPrepareCompaction: eligibleInitially,
+    });
+    const session = new RefreshedHostSession(() => makeLargeBranch(), {});
+    session._bindExtensionCore({});
+
+    // A reload re-installs the adapter with the host's current helper.
+    installInlineCompactionAdapter({
+      sessionClass: RefreshedHostSession,
+      hostPrepareCompaction: refreshedIneligible,
+    });
+    session._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], { sessionManager: session.sessionManager });
+
+    handler(agentEnd(), ctx);
+    await flushAll();
+
+    expect(ctx.compact).not.toHaveBeenCalled();
+    expect(runtime.compactInFlight).toBe(false);
+    expect(refreshedIneligible).toHaveBeenCalledTimes(1);
+    expect(eligibleInitially).not.toHaveBeenCalled();
   });
 });
