@@ -125,9 +125,12 @@ export function getOpenCodeSessionHeaders(
 }
 
 /**
- * Generic choke point: merge provider-required attribution headers over base
+ * Generic choke point: merge provider-required attribution headers under base
  * headers. Add future provider rules here — never at the stage call sites.
- * Attribution wins over stale base values (e.g. a previous session's id).
+ * Merge order is pi-core parity (`mergeProviderAttributionHeaders` applies
+ * caller `headerSources` last): caller-supplied headers win over attribution.
+ * In practice the two never collide — auth-resolved base headers don't carry
+ * session ids — so this matches pi's wire behavior exactly.
  */
 export function withProviderAttributionHeaders(
   model: { provider?: unknown; baseUrl?: unknown } | null | undefined,
@@ -136,7 +139,7 @@ export function withProviderAttributionHeaders(
 ): Record<string, string> | undefined {
   const attribution = getOpenCodeSessionHeaders(model, sessionId);
   if (!attribution) return headers;
-  return { ...headers, ...attribution };
+  return { ...attribution, ...headers };
 }
 
 /** Minimal `transformHeaders` shape (pi-ai `ModelsRequestTransforms`). */
@@ -149,7 +152,7 @@ export type AttributionTransform = (
  * then chaining the caller's transform (if any). This is the seam where pi's
  * own `transformHeaders` concept runs — pi-ai's `applyAuth` honors it, so
  * builtin providers get attribution at pi's layer, after auth headers.
- * Idempotent: re-applying the same session's attribution is a no-op overwrite.
+ * Idempotent: re-applying the same session's attribution preserves values.
  */
 export function createAttributionTransform(
   model: { provider?: unknown; baseUrl?: unknown } | null | undefined,

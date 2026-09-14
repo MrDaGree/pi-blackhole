@@ -15,6 +15,7 @@ import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { type ResolveResult, type Runtime, type RuntimeGeneration } from "./runtime.js";
 import { withProviderAttributionHeaders } from "./provider-stream.js";
 import {
+  isCooldownWorthyError,
   isDeterministicError,
   isRetryableError,
   isStaleExtensionContextError,
@@ -917,6 +918,7 @@ export async function runObserverStage(
         error: String(error),
         retryable: isRetryableError(error),
         deterministic: isDeterministicError(error),
+        cooldownWorthy: isCooldownWorthyError(error),
       });
       // Continue loop — resolveModel will skip the cooled-down model
       continue;
@@ -1179,6 +1181,7 @@ async function runReflectorStage(
         error: String(error),
         retryable: isRetryableError(error),
         deterministic: isDeterministicError(error),
+        cooldownWorthy: isCooldownWorthyError(error),
       });
       continue;
     }
@@ -1426,6 +1429,7 @@ async function runDropperStage(
         error: String(error),
         retryable: isRetryableError(error),
         deterministic: isDeterministicError(error),
+        cooldownWorthy: isCooldownWorthyError(error),
       });
       continue;
     }

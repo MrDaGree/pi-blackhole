@@ -34,6 +34,21 @@ describe("deterministic client errors", () => {
     expect(isDeterministicError(new Error("Unauthorized"))).toBe(true);
   });
 
+  it("classifies bare 4xx codes with an error signal as deterministic", () => {
+    expect(isDeterministicError(new Error("403 RegionError: model not available"))).toBe(true);
+    expect(isDeterministicError(new Error("400 Bad Request"))).toBe(true);
+    expect(isDeterministicError(new Error("404 Not Found: /v1/models"))).toBe(true);
+    expect(isDeterministicError(new Error("request failed with 404"))).toBe(true);
+  });
+
+  it("ignores bare 4xx codes without an error signal", () => {
+    expect(isDeterministicError(new Error("recorded 404 observations"))).toBe(false);
+    expect(isDeterministicError(new Error("processed 403 entries successfully"))).toBe(false);
+    expect(isDeterministicError(new Error("context window 8000 too small for input 10000"))).toBe(
+      false,
+    );
+  });
+
   it("does not mistake token counts or plain prose for status codes", () => {
     // Bare numbers without error framing must not match (e.g. progress lines
     // like "~401-token chunk" flow through nearby logging, never as errors,

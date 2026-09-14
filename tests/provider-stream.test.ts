@@ -87,16 +87,19 @@ describe("provider attribution (generic choke point)", () => {
     expect(withProviderAttributionHeaders(null, headers, "s-1")).toBe(headers);
   });
 
-  it("overwrites a stale session id with the current one", () => {
+  it("preserves a caller-supplied session value (pi-core parity: caller wins)", () => {
+    // Mirrors pi core `mergeProviderAttributionHeaders`, which applies caller
+    // `headerSources` last. In practice auth-resolved base headers never carry
+    // a session id, so the piles never collide — this just pins the order.
     expect(
       withProviderAttributionHeaders(
         { provider: "opencode" },
-        { "x-existing": "keep", "x-opencode-session": "stale" },
+        { "x-existing": "keep", "x-opencode-session": "caller-value" },
         "current",
       ),
     ).toEqual({
       "x-existing": "keep",
-      "x-opencode-session": "current",
+      "x-opencode-session": "caller-value",
       "x-opencode-client": "pi",
     });
   });
