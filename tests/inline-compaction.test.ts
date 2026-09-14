@@ -6,7 +6,12 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Context } from "@earendil-works/pi-ai/compat";
-import type { CompactionEntry, CompactionResult } from "@earendil-works/pi-coding-agent";
+import type {
+  CompactionEntry,
+  CompactionResult,
+  ExtensionHandler,
+  TurnEndEvent,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 
@@ -1463,7 +1468,7 @@ describe("Blackhole inline compaction adapter", () => {
   async function runTurnEndCompactionScenario(options: TurnEndScenarioOptions): Promise<void> {
     await options.install();
 
-    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const turnEndHandlers: ExtensionHandler<TurnEndEvent>[] = [];
     const runtime = new Runtime();
     runtime.config = {
       ...runtime.config,
@@ -1486,11 +1491,11 @@ describe("Blackhole inline compaction adapter", () => {
     runtime.inlineCompactionWarningEmitted = false;
 
     registerCompactionTrigger(
-      createExtensionApiDouble({ handlers }),
+      createExtensionApiDouble({ turnEndHandlers }),
       runtime,
       compactInlineAtTurnBoundary,
     );
-    const turnEndHandler = handlers.get("turn_end");
+    const turnEndHandler = turnEndHandlers[0];
     if (typeof turnEndHandler !== "function") {
       throw new Error("registerCompactionTrigger did not register a turn_end handler");
     }
@@ -1563,19 +1568,18 @@ describe("Blackhole inline compaction adapter", () => {
 
       let activeRunSignal: AbortSignal | undefined;
       let handlerError: unknown;
+      let turnIndex = 0;
       harness.agent.subscribe(async (event, signal) => {
         if (event.type !== "turn_end") return;
         activeRunSignal = signal;
         try {
-          await turnEndHandler(event, {
-            cwd: process.cwd(),
-            sessionManager: harness.sessionManager,
-            hasUI: false,
-            ui: undefined,
-            signal,
-            model: undefined,
-            isIdle: () => true,
-          });
+          await turnEndHandler(
+            { ...event, turnIndex: turnIndex++ },
+            {
+              ...harness.session.extensionRunner.createContext(),
+              signal,
+            },
+          );
         } catch (error) {
           handlerError = error;
           throw error;

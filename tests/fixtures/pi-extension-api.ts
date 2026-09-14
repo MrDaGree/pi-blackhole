@@ -1,4 +1,4 @@
-import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type ExtensionAPI, type ExtensionEvent, type ExtensionHandler, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
 
 /**
  * Host-interface double for extension wiring tests.
@@ -9,11 +9,11 @@ import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-age
  * reached, so unexpected host usage fails loudly instead of silently passing.
  */
 export interface ExtensionApiDoubleOptions {
-  handlers?: Map<string, (...args: unknown[]) => unknown>;
+  turnEndHandlers?: ExtensionHandler<TurnEndEvent>[];
   appendEntry?: (customType: string, data: unknown) => unknown;
 }
 
-function notImplemented(member: keyof ExtensionAPI): (...args: any[]) => never {
+function notImplemented(member: keyof ExtensionAPI): () => never {
   return () => {
     throw new Error(`createExtensionApiDouble: ${String(member)} is not implemented`);
   };
@@ -21,8 +21,12 @@ function notImplemented(member: keyof ExtensionAPI): (...args: any[]) => never {
 
 export function createExtensionApiDouble(options: ExtensionApiDoubleOptions = {}): ExtensionAPI {
   return {
-    on(event: string, handler: (...args: any[]) => unknown) {
-      options.handlers?.set(event, handler);
+    on(...[event, handler]:
+      | [event: "turn_end", handler: ExtensionHandler<TurnEndEvent>]
+      | [event: Exclude<ExtensionEvent["type"], "turn_end">, handler: (...args: never[]) => unknown]
+    ) {
+      // Other events are registered but never replayed by these fixtures.
+      if (event === "turn_end") options.turnEndHandlers?.push(handler);
     },
     appendEntry(customType: string, data: unknown) {
       options.appendEntry?.(customType, data);
