@@ -76,7 +76,7 @@
       "oxlint --fix"
     ],
     "*.{ts,js,mjs,cjs,json,jsonc,md}": [
-      "oxfmt"
+      "oxfmt --no-error-on-unmatched-pattern"
     ]
   },
   "packageManager": "pnpm@11.2.2",
