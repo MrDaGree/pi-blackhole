@@ -13,7 +13,12 @@ import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ConfiguredModel } from "./config.js";
 import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { type ResolveResult, type Runtime, type RuntimeGeneration } from "./runtime.js";
-import { isRetryableError, isStaleExtensionContextError } from "./retryable-error.js";
+import { withProviderAttributionHeaders } from "./provider-stream.js";
+import {
+  isDeterministicError,
+  isRetryableError,
+  isStaleExtensionContextError,
+} from "./retryable-error.js";
 import { effectiveContextWindow } from "./model-budget.js";
 import { serializeSourceAddressedBranchEntries } from "./serialize.js";
 
@@ -807,7 +812,7 @@ export async function runObserverStage(
       const result = await runObserver({
         model: resolved.model as any,
         apiKey: resolved.apiKey,
-        headers: resolved.headers,
+        headers: withProviderAttributionHeaders(resolved.model as any, resolved.headers, sessionId),
         env: resolved.env,
         priorReflections,
         priorObservations,
@@ -819,6 +824,7 @@ export async function runObserverStage(
         providerIdleTimeoutMs: runtime.config.providerIdleTimeoutMs,
         signal: generation.signal,
         modelRegistry: ctx.modelRegistry,
+        sessionId,
       });
       if (!runtime.isGenerationActive(generation)) return "abort";
 
@@ -894,6 +900,9 @@ export async function runObserverStage(
       }
       // Always try next fallback — don't abort pipeline for a single model failure.
       // Record cooldown so resolveModel skips this model in the next iteration.
+      // Deterministic 4xx (e.g. MissingSessionID) additionally cools the
+      // resolved model itself: the session model has no candidate config, so
+      // without this it would retry identically on every cycle.
       const candidateConfig = runtime.findCandidateConfig(resolved.model, {
         model: ctx.model,
         modelRegistry: ctx.modelRegistry,
@@ -903,9 +912,11 @@ export async function runObserverStage(
         stageFallbacks: stageFallbackModels(runtime, "observer"),
       });
       runtime.recordRetryableError(candidateConfig, error, "observer");
+      if (!candidateConfig) runtime.recordDeterministicError(resolved.model, error, "observer");
       debugLog("observer.error", {
         error: String(error),
         retryable: isRetryableError(error),
+        deterministic: isDeterministicError(error),
       });
       // Continue loop — resolveModel will skip the cooled-down model
       continue;
@@ -1099,7 +1110,7 @@ async function runReflectorStage(
       const reflections = await runReflector({
         model: resolved.model as any,
         apiKey: resolved.apiKey,
-        headers: resolved.headers,
+        headers: withProviderAttributionHeaders(resolved.model as any, resolved.headers, sessionId),
         env: resolved.env,
         reflections: newReflections,
         observations: newObservations,
@@ -1110,6 +1121,7 @@ async function runReflectorStage(
         providerIdleTimeoutMs: runtime.config.providerIdleTimeoutMs,
         signal: generation.signal,
         modelRegistry: ctx.modelRegistry,
+        sessionId,
       });
       if (!runtime.isGenerationActive(generation))
         return { outcome: "abort", sameRunReflections: [] };
@@ -1162,9 +1174,11 @@ async function runReflectorStage(
         stageFallbacks: stageFallbackModels(runtime, "reflector"),
       });
       runtime.recordRetryableError(candidateConfig, error, "reflector");
+      if (!candidateConfig) runtime.recordDeterministicError(resolved.model, error, "reflector");
       debugLog("reflector.error", {
         error: String(error),
         retryable: isRetryableError(error),
+        deterministic: isDeterministicError(error),
       });
       continue;
     }
@@ -1348,7 +1362,7 @@ async function runDropperStage(
       const droppedIds = await runDropper({
         model: resolved.model as any,
         apiKey: resolved.apiKey,
-        headers: resolved.headers,
+        headers: withProviderAttributionHeaders(resolved.model as any, resolved.headers, sessionId),
         env: resolved.env,
         reflections: reflectionsForDropper,
         observations: newObservations,
@@ -1360,6 +1374,7 @@ async function runDropperStage(
         providerIdleTimeoutMs: runtime.config.providerIdleTimeoutMs,
         signal: generation.signal,
         modelRegistry: ctx.modelRegistry,
+        sessionId,
       });
       if (!runtime.isGenerationActive(generation)) return "abort";
       const latestReflectionCoverageId = isManualMode(runtime.config)
@@ -1406,9 +1421,11 @@ async function runDropperStage(
         stageFallbacks: stageFallbackModels(runtime, "dropper"),
       });
       runtime.recordRetryableError(candidateConfig, error, "dropper");
+      if (!candidateConfig) runtime.recordDeterministicError(resolved.model, error, "dropper");
       debugLog("dropper.error", {
         error: String(error),
         retryable: isRetryableError(error),
+        deterministic: isDeterministicError(error),
       });
       continue;
     }

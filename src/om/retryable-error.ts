@@ -18,6 +18,37 @@ export function isRetryableError(error: unknown): boolean {
   return RETRYABLE_ERROR_RE.test(message);
 }
 
+/**
+ * Deterministic client errors: retrying the same model cannot succeed without
+ * a config/header fix (missing provider-required headers, bad credentials,
+ * unknown model, rejected payload). Unlike transient `isRetryableError`
+ * failures (same model, later), these must engage the fallback chain and
+ * cool the broken model down instead of burning every consolidation cycle.
+ *
+ * Anchored on explicit signals to avoid false positives from token counts
+ * (e.g. "~401-token chunk") — bare status codes only match with an
+ * error framing (`HTTP 400`, `status: 404`, `error: 422`).
+ */
+export const DETERMINISTIC_ERROR_RE =
+  /MissingSessionID|missing.?session|invalid.?api.?key|unauthorized|HTTP\s+40[014]\b|HTTP\s+4(?:03|22)\b|status\s*:?\s*40[014]\b|status\s*:?\s*4(?:03|22)\b|error\s*:?\s*40[014]\b|error\s*:?\s*4(?:03|22)\b/i;
+
+/** Check whether an error is a deterministic client error (see above). */
+export function isDeterministicError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return DETERMINISTIC_ERROR_RE.test(message);
+}
+
+/**
+ * Cooldown-worthy errors: transient (retry the same model later) or
+ * deterministic (try a fallback now, cool the broken model). The consolidation
+ * pipeline records cooldown for both; `isRetryableError` alone only covers
+ * the transient half (429/5xx/timeout), which is why deterministic 4xx like
+ * `MissingSessionID` previously retried the same broken model indefinitely.
+ */
+export function isCooldownWorthyError(error: unknown): boolean {
+  return isRetryableError(error) || isDeterministicError(error);
+}
+
 /** Detect Pi's "extension ctx is stale" error from session replacement/reload.
  *  These are not model errors and must not be recorded as cooldowns. */
 export function isStaleExtensionContextError(error: unknown): boolean {
