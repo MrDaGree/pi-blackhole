@@ -92,6 +92,12 @@ export function registerCompactionTrigger(
     // Reset the info gate — allow one info notification during the new turn.
     runtime.resetInfoGate();
 
+    // agent_start fires before the first turn_end, so load the current config
+    // here: the resume warning below must not read a stale/default mode.
+    if (ctx?.cwd) {
+      runtime.ensureConfig(ctx.cwd, (msg: string) => ctx.ui?.notify?.(msg, "warning"));
+    }
+
     // A new turn is starting — abort any pending auto-compaction wait.
     // The new turn's own agent_end will re-evaluate the threshold and
     // schedule a fresh wait if compaction is still needed.

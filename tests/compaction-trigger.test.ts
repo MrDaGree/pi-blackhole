@@ -1025,6 +1025,58 @@ describe("inline adapter classification", () => {
     ok.startHandler(undefined, fakeCtx([belowBranch]));
     expect(ok.runtime.config.midRunCompaction).toBe("resume");
   });
+  it("loads config at agent_start before deciding on the resume warning", () => {
+    const { startHandler, runtime } = captureHandler({});
+    // First run: no config loaded yet — only ensureConfig can supply the mode.
+    runtime.config.midRunCompaction = undefined;
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    runtime.ensureConfig = vi.fn((cwd: string) => {
+      expect(cwd).toBe("/tmp/project");
+      runtime.config.midRunCompaction = "resume";
+    });
+    const ctx = fakeCtx([belowBranch]);
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.ensureConfig).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify.mock.calls[0][0]).toContain("pi lacks API");
+    expect(ctx.ui.notify.mock.calls[0][1]).toBe("warning");
+  });
+
+  it("stays silent at agent_start when the loaded config is not resume", () => {
+    const { startHandler, runtime } = captureHandler({});
+    runtime.config.midRunCompaction = undefined;
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    runtime.ensureConfig = vi.fn(() => {
+      runtime.config.midRunCompaction = "pause";
+    });
+    const ctx = fakeCtx([belowBranch]);
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.ensureConfig).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("marks the warning emitted without notifying when the ctx has no UI", () => {
+    const { startHandler, runtime } = captureHandler({ midRunCompaction: "resume" });
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    const ctx = fakeCtx([belowBranch], { hasUI: false, ui: undefined });
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.inlineCompactionWarningEmitted).toBe(true);
+  });
 });
 
 describe("Context-window-derived threshold (issue #60)", () => {

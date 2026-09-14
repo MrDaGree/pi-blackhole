@@ -551,52 +551,71 @@ export async function installHostInlineCompactionAdapter(
 
   await resolveHostPrepareCompaction(packageRoots, registry);
 
-  // Collect fast candidates first: per package root, pi's already-loaded
-  // bundled runtime chunk (cache-hit, ~0-10ms). A root that resolves a chunk
-  // never needs its modular dist/index.js barrel (fresh graph, ~400-500ms).
-  const modulePaths = new Set<string>();
-  const rootsWithChunk = new Set<string>();
+  // Fast candidates first: per package root, pi's already-loaded bundled
+  // runtime chunk (cache-hit, ~0-10ms). A resolved chunk path only proves the
+  // entrypoint imports *some* local module — it does not prove AgentSession is
+  // exported (pi's unbundled dist/cli.js imports dist/main.js, which is not the
+  // module barrel). The modular dist/index.js barrel (fresh graph, ~400-500ms)
+  // is therefore tried per root only after that root's fast candidates ran.
+  const fastCandidates = new Map<string, string>();
+  const attemptedPaths = new Set<string>();
   for (const hostPath of hostPaths) {
     for (const packageRoot of packageRoots) {
       if (findPiPackageRoot(hostPath) !== packageRoot) continue;
       const bundledRuntime = findBundledRuntimeModule(hostPath, packageRoot);
-      if (bundledRuntime) {
-        modulePaths.add(bundledRuntime);
-        rootsWithChunk.add(packageRoot);
-      }
+      if (!bundledRuntime) continue;
+      fastCandidates.set(bundledRuntime, packageRoot);
+      attemptedPaths.add(bundledRuntime);
     }
   }
-  // Fallback barrels: only for roots that had no bundled runtime (e.g. pi
-  // versions whose entrypoint is the plain unbundled dist layout).
-  for (const packageRoot of packageRoots) {
-    if (rootsWithChunk.has(packageRoot)) continue;
-    modulePaths.add(join(packageRoot, "dist", "index.js"));
-  }
-  getRegistry().hostCandidateCount = modulePaths.size;
 
   const failureReasons: string[] = [];
+  const supportedRoots = new Set<string>();
   let supportedStatus: InlineCompactionAdapterStatus | undefined;
-  for (const modulePath of modulePaths) {
+  let attemptedCount = 0;
+
+  const attempt = async (modulePath: string, packageRoot: string): Promise<void> => {
+    attemptedCount += 1;
     try {
       const hostModule = (await import(pathToFileURL(modulePath).href)) as {
         AgentSession?: PatchableSessionClass;
       };
       if (!hostModule.AgentSession) {
         failureReasons.push(`${modulePath}: AgentSession export missing`);
-        continue;
+        return;
       }
 
       const status = installInlineCompactionAdapter({
         sessionClass: hostModule.AgentSession,
       });
-      if (status.supported) supportedStatus ??= status;
-      else failureReasons.push(`${modulePath}: ${status.reason ?? "unsupported"}`);
+      if (status.supported) {
+        supportedStatus ??= status;
+        supportedRoots.add(packageRoot);
+      } else {
+        failureReasons.push(`${modulePath}: ${status.reason ?? "unsupported"}`);
+      }
     } catch (error) {
       failureReasons.push(
         `${modulePath}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  };
+
+  for (const [modulePath, packageRoot] of fastCandidates) {
+    await attempt(modulePath, packageRoot);
   }
+
+  // Same-root fallback barrel for every root that produced no supported
+  // candidate. Roots already patched through a fast candidate skip this, so a
+  // working bundle still never pays the barrel's import cost.
+  for (const packageRoot of packageRoots) {
+    if (supportedRoots.has(packageRoot)) continue;
+    const modulePath = join(packageRoot, "dist", "index.js");
+    if (attemptedPaths.has(modulePath)) continue;
+    attemptedPaths.add(modulePath);
+    await attempt(modulePath, packageRoot);
+  }
+  getRegistry().hostCandidateCount = attemptedCount;
 
   if (supportedStatus) return supportedStatus;
   const details = failureReasons.length > 0 ? ` (${failureReasons.join("; ")})` : "";

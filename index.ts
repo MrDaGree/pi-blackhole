@@ -26,7 +26,7 @@ export default async (pi: ExtensionAPI) => {
   // Resolve the host's AgentSession identity before this factory returns. Local
   // package development can otherwise patch a duplicate devDependency module.
   // The adapter is reload-idempotent and fails closed on unknown Pi internals.
-  await installHostInlineCompactionAdapter();
+  const inlineCompactionAdapterStatus = await installHostInlineCompactionAdapter();
   // ── Bridge: capture custom provider stream functions for jiti-loaded agents ──
   // pi-blackhole's consolidation agents are loaded via jiti with moduleCache: false,
   // which creates a separate pi-ai instance whose apiProviderRegistry lacks custom
@@ -57,6 +57,9 @@ export default async (pi: ExtensionAPI) => {
   scaffoldSettings();
 
   const omRuntime = new Runtime();
+  // Carry the startup probe result into the runtime so triggers can explain an
+  // unsupported host instead of silently falling back every run.
+  omRuntime.inlineCompactionAdapterStatus = inlineCompactionAdapterStatus;
 
   // Observational memory: background consolidation pipeline
   registerConsolidationTrigger(pi, omRuntime); // agent_start + turn_end → observer/reflector/dropper

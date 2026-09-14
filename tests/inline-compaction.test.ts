@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,7 @@ import {
   parseHostFramePaths,
 } from "../src/om/inline-compaction.js";
 import { createPiAgentSessionHarness } from "./fixtures/pi-agent-session.js";
+import { registerCompactionTrigger } from "../src/om/compaction-trigger.js";
 
 interface FakeTurnContext {
   messages: unknown[];
@@ -171,6 +173,32 @@ async function refreshNextTurn(session: InstanceType<ReturnType<typeof createSes
     },
     new AbortController().signal,
   );
+}
+
+const HOST_MANIFEST = JSON.stringify({
+  name: "@earendil-works/pi-coding-agent",
+  type: "module",
+});
+
+/** Minimal loadable AgentSession that satisfies Blackhole's compact shape guard. */
+function hostSessionSource(summary: string): string {
+  return `export class AgentSession {
+  constructor() {
+    this.agent = { state: { messages: [] } };
+    this.sessionManager = {
+      buildSessionContext: () => ({ messages: [] }),
+      appendCompaction: () => {},
+    };
+  }
+  async abort() {}
+  _bindExtensionCore() {}
+  async compact() {
+    await this.abort();
+    this.sessionManager.appendCompaction();
+    this.agent.state.messages = [];
+    return { summary: "${summary}", firstKeptEntryId: "kept", tokensBefore: 1 };
+  }
+}`;
 }
 
 describe("Blackhole inline compaction adapter", () => {
@@ -613,6 +641,102 @@ describe("Blackhole inline compaction adapter", () => {
     }
   });
 
+  it("falls back to a root's dist barrel when its fast candidate lacks AgentSession", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-unbundled-host-"));
+    const packageRoot = join(fixtureRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+    const dist = join(packageRoot, "dist");
+    try {
+      await mkdir(dist, { recursive: true });
+      await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
+      // `dist/cli.js` is pi's unbundled CLI shim: it imports `main` from
+      // `dist/main.js`, which is not the module barrel and exports no AgentSession.
+      await writeFile(join(dist, "main.js"), "export async function main() {}\n");
+      await writeFile(join(dist, "index.js"), hostSessionSource("barrel-summary"));
+      await writeFile(
+        join(dist, "cli.js"),
+        '#!/usr/bin/env node\nimport { main } from "./main.js";\nvoid main();\n',
+      );
+
+      const barrel = (await import(pathToFileURL(join(dist, "index.js")).href)) as {
+        AgentSession: new () => {
+          _bindExtensionCore(runner: unknown): void;
+          sessionManager: object;
+        };
+      };
+      const originalBind = barrel.AgentSession.prototype._bindExtensionCore;
+
+      await expect(
+        installHostInlineCompactionAdapter({ entrypoint: join(dist, "cli.js"), stack: "" }),
+      ).resolves.toEqual({ supported: true });
+      expect(barrel.AgentSession.prototype._bindExtensionCore).not.toBe(originalBind);
+
+      const session = new barrel.AgentSession();
+      session._bindExtensionCore({});
+      await expect(compactInlineAtTurnBoundary(session.sessionManager)).resolves.toMatchObject({
+        summary: "barrel-summary",
+      });
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not import a root's dist barrel once its fast candidate is supported", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-fast-host-"));
+    const packageRoot = join(fixtureRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+    const dist = join(packageRoot, "dist");
+    const chunks = join(dist, "bundle", "chunks");
+    try {
+      await mkdir(chunks, { recursive: true });
+      await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
+      // A throwing barrel proves the fast path never pays the barrel import.
+      await writeFile(
+        join(dist, "index.js"),
+        'throw new Error("dist barrel must not be imported");\n',
+      );
+      await writeFile(
+        join(chunks, "runtime.js"),
+        `${hostSessionSource("fast-summary")}\nexport function main() {}\n`,
+      );
+      await writeFile(
+        join(dist, "cli.js"),
+        '#!/usr/bin/env node\nimport { main } from "./bundle/chunks/runtime.js";\nvoid main();\n',
+      );
+
+      await expect(
+        installHostInlineCompactionAdapter({ entrypoint: join(dist, "cli.js"), stack: "" }),
+      ).resolves.toEqual({ supported: true });
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("accumulates every rejected candidate path in the discovery failure", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-rejected-host-"));
+    const packageRoot = join(fixtureRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+    const dist = join(packageRoot, "dist");
+    try {
+      await mkdir(dist, { recursive: true });
+      await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
+      await writeFile(join(dist, "main.js"), "export async function main() {}\n");
+      await writeFile(join(dist, "index.js"), "export const notASession = 1;\n");
+      await writeFile(
+        join(dist, "cli.js"),
+        '#!/usr/bin/env node\nimport { main } from "./main.js";\nvoid main();\n',
+      );
+
+      const status = await installHostInlineCompactionAdapter({
+        entrypoint: join(dist, "cli.js"),
+        stack: "",
+      });
+
+      expect(status.supported).toBe(false);
+      expect(status.reason).toContain(`${join(dist, "main.js")}: AgentSession export missing`);
+      expect(status.reason).toContain(`${join(dist, "index.js")}: AgentSession export missing`);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
   it("patches every independently loaded host AgentSession identity", async () => {
     const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-host-identities-"));
     const makeHostPackage = async (name: string) => {
@@ -976,5 +1100,207 @@ describe("Blackhole inline compaction adapter", () => {
     const prepareStatus = getPrepareCompactionStatus();
     expect(prepareStatus.resolved).toBe(true);
     expect(prepareStatus.source).toContain("compaction");
+  });
+
+  it("resolves the installed host through its unbundled CLI shim entrypoint", async () => {
+    const cliPath = join(
+      process.cwd(),
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+      "dist",
+      "cli.js",
+    );
+
+    expect(existsSync(cliPath)).toBe(true);
+    await expect(
+      installHostInlineCompactionAdapter({ entrypoint: cliPath, stack: "" }),
+    ).resolves.toEqual({ supported: true });
+  });
+
+  it("compacts through the registered turn_end trigger before the next provider request", async () => {
+    // Eligibility is injected so this test exercises the trigger → adapter →
+    // provider path rather than the host's prepareCompaction resolver.
+    installInlineCompactionAdapter({
+      prepareCompaction: () => ({ firstKeptEntryId: "entry-1" }),
+    });
+
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    const runtime = {
+      ensureConfig: vi.fn(),
+      resetInfoGate: vi.fn(),
+      tryEmitInfo: vi.fn(),
+      config: {
+        compaction: "auto",
+        compactionEngine: "blackhole",
+        passive: false,
+        noAutoCompact: false,
+        overrideDefaultCompaction: true,
+        memory: true,
+        midRunCompaction: "resume",
+        compactAfterTokens: 1,
+      },
+      compactInFlight: false,
+      autoCompactionController: null as AbortController | null,
+      midRunCompactionRetry: { failures: 0, retryAfter: 0 },
+      inlineCompactionAdapterStatus: undefined as
+        | { supported: boolean; reason?: string }
+        | undefined,
+      inlineCompactionWarningEmitted: false,
+      debugLog: false,
+    };
+    registerCompactionTrigger(
+      {
+        on: (name: string, cb: (...args: any[]) => unknown) => {
+          handlers.set(name, cb);
+        },
+      } as never,
+      runtime as never,
+      compactInlineAtTurnBoundary,
+    );
+    const turnEndHandler = handlers.get("turn_end");
+    expect(turnEndHandler).toBeTypeOf("function");
+
+    const summaryStarted = createDeferred();
+    const releaseSummary = createDeferred();
+    const nextRequestStarted = createDeferred();
+    const releaseFinalResponse = createDeferred();
+    const parameters = Type.Object({});
+    const tool: AgentTool<typeof parameters> = {
+      name: "echo",
+      label: "Echo",
+      description: "Return a deterministic result",
+      parameters,
+      execute: async () => ({
+        content: [{ type: "text", text: "tool-result" }],
+        details: {},
+      }),
+    };
+    const harness = await createPiAgentSessionHarness([tool]);
+    let promptPromise: Promise<void> | undefined;
+
+    try {
+      harness.sessionManager.appendMessage({
+        role: "user",
+        content: `old-user-1 ${"x".repeat(5_000)}`,
+        timestamp: 1,
+      });
+      harness.sessionManager.appendMessage(
+        fauxAssistantMessage("old-assistant-1", { timestamp: 2 }),
+      );
+      harness.sessionManager.appendMessage({
+        role: "user",
+        content: `old-user-2 ${"y".repeat(5_000)}`,
+        timestamp: 3,
+      });
+      harness.sessionManager.appendMessage(
+        fauxAssistantMessage("old-assistant-2", { timestamp: 4 }),
+      );
+      harness.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+
+      const requestContexts: Context["messages"][] = [];
+      let nextRequestMessages: Context["messages"] | undefined;
+      harness.setResponses([
+        async (context) => {
+          requestContexts.push(context.messages);
+          return fauxAssistantMessage(fauxToolCall("echo", {}, { id: "tool-1" }), {
+            stopReason: "toolUse",
+          });
+        },
+        async (context) => {
+          requestContexts.push(context.messages);
+          summaryStarted.release();
+          await releaseSummary.promise;
+          return fauxAssistantMessage("COMPACTED-SUMMARY");
+        },
+        async (context) => {
+          requestContexts.push(context.messages);
+          nextRequestMessages = context.messages;
+          nextRequestStarted.release();
+          await releaseFinalResponse.promise;
+          return fauxAssistantMessage("finished");
+        },
+      ]);
+
+      const savedCompactions: unknown[] = [];
+      harness.session.subscribe((event) => {
+        if (event.type === "compaction_end" && event.result) savedCompactions.push(event.result);
+      });
+
+      let activeRunSignal: AbortSignal | undefined;
+      let handlerError: unknown;
+      harness.agent.subscribe(async (event, signal) => {
+        if (event.type !== "turn_end") return;
+        activeRunSignal = signal;
+        try {
+          await turnEndHandler!(event, {
+            cwd: process.cwd(),
+            sessionManager: harness.sessionManager,
+            hasUI: false,
+            ui: undefined,
+            signal,
+            model: undefined,
+            isIdle: () => true,
+          });
+        } catch (error) {
+          handlerError = error;
+          throw error;
+        }
+      });
+
+      let promptSettled = false;
+      promptPromise = harness.session.prompt("use the echo tool and then finish").finally(() => {
+        promptSettled = true;
+      });
+
+      await Promise.race([
+        summaryStarted.promise,
+        promptPromise.then(() => {
+          throw new Error(
+            `prompt settled before the trigger compaction summary started: ${String(handlerError)}`,
+          );
+        }),
+      ]);
+      expect(promptSettled).toBe(false);
+      expect(harness.session.isStreaming).toBe(true);
+      expect(activeRunSignal?.aborted).toBe(false);
+
+      releaseSummary.release();
+      await Promise.race([
+        nextRequestStarted.promise,
+        promptPromise.then(() => {
+          throw new Error(
+            `prompt settled before the post-compaction request: ${String(handlerError)}`,
+          );
+        }),
+      ]);
+      expect(handlerError).toBeUndefined();
+      expect(promptSettled).toBe(false);
+      expect(activeRunSignal?.aborted).toBe(false);
+      expect(runtime.compactInFlight).toBe(false);
+      expect(savedCompactions).toHaveLength(1);
+
+      const compactedMessages = harness.sessionManager.buildSessionContext().messages;
+      expect(nextRequestMessages).toEqual(convertToLlm(compactedMessages));
+      expect(JSON.stringify(nextRequestMessages)).toContain("COMPACTED-SUMMARY");
+      expect(JSON.stringify(nextRequestMessages)).not.toContain("old-user-1");
+      // Exactly one tool turn, one summarization request, one continuation —
+      // a resubmitted prompt would need a fourth faux response.
+      expect(requestContexts).toHaveLength(3);
+
+      releaseFinalResponse.release();
+      await promptPromise;
+      expect(promptSettled).toBe(true);
+      expect(savedCompactions).toHaveLength(1);
+      expect(harness.session.messages.at(-1)).toMatchObject({
+        role: "assistant",
+        stopReason: "stop",
+      });
+    } finally {
+      releaseSummary.release();
+      releaseFinalResponse.release();
+      await promptPromise?.catch(() => undefined);
+      harness.cleanup();
+    }
   });
 });
