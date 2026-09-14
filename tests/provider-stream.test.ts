@@ -9,19 +9,20 @@ import {
   isOpenCodeModel,
   matchesProviderHost,
   providerStreamKey,
-  withOpenCodeSessionHeaders,
   withProviderAttributionHeaders,
 } from "../src/om/provider-stream.js";
 
 const dispatcherSymbol = Symbol.for("undici.globalDispatcher.2");
 const originalDispatcher = (globalThis as any)[dispatcherSymbol];
 
-// PR #95 regression coverage — kept verbatim. The contributor verified these
-// against a live OpenCode Go gateway (400 MissingSessionID without headers).
+// PR #95 contract — kept as behavioral equivalence proof. The contributor
+// verified these inputs/outputs against a live OpenCode Go gateway (400
+// MissingSessionID without headers). Retargeted at the generic choke point:
+// identical inputs must produce identical outputs to the fork's heuristic.
 describe("OpenCode session headers", () => {
   it("adds stable session headers for OpenCode providers", () => {
     expect(
-      withOpenCodeSessionHeaders(
+      withProviderAttributionHeaders(
         { provider: "opencode-go" },
         { "x-existing": "keep" },
         "session-123",
@@ -35,7 +36,7 @@ describe("OpenCode session headers", () => {
 
   it("does not add OpenCode headers to unrelated providers", () => {
     const headers = { "x-existing": "keep" };
-    expect(withOpenCodeSessionHeaders({ provider: "openrouter" }, headers, "session-123")).toBe(
+    expect(withProviderAttributionHeaders({ provider: "openrouter" }, headers, "session-123")).toBe(
       headers,
     );
   });
@@ -100,12 +101,13 @@ describe("provider attribution (generic choke point)", () => {
     });
   });
 
-  it("legacy alias agrees with the generic helper", () => {
-    const model = { provider: "opencode-go", baseUrl: "https://proxy.local" };
-    const headers = { "x-existing": "keep" };
-    expect(withProviderAttributionHeaders(model, headers, "s-9")).toEqual(
-      withOpenCodeSessionHeaders(model, headers, "s-9"),
-    );
+  it("never mutates the base headers (fallback chain reuses resolved objects)", () => {
+    const base = { "x-existing": "keep", "x-opencode-session": "stale" };
+    const snapshot = { ...base };
+    withProviderAttributionHeaders({ provider: "opencode-go" }, base, "current");
+    expect(base).toEqual(snapshot);
+    withProviderAttributionHeaders({ provider: "openrouter" }, base, "current");
+    expect(base).toEqual(snapshot);
   });
 
   it("getOpenCodeSessionHeaders is pure: undefined unless OpenCode + session", () => {
@@ -577,5 +579,44 @@ describe("bridge session attribution (generic, no per-provider branching)", () =
       "x-opencode-client": "pi",
       "x-caller": "yes",
     });
+  });
+
+  it("never carries attribution across providers sharing one session", () => {
+    // Stages resolve different providers (observer → opencode-go, reflector →
+    // openrouter) under the SAME Pi session id. Attribution is derived per
+    // call from that call's model — the openrouter call must be untouched.
+    const { fallback, seen } = captureFallback();
+    const bridge = createBridgeStreamFn(fallback);
+    bridge({ provider: "opencode-go", api: "anthropic-messages" }, "ctx", {
+      headers: { "x-existing": "keep" },
+      sessionId: "same-session",
+    });
+    const openrouterOpts = { headers: { "x-existing": "keep" }, sessionId: "same-session" };
+    bridge({ provider: "openrouter", api: "openai-completions" }, "ctx", openrouterOpts);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]!.opts.headers["x-opencode-session"]).toBe("same-session");
+    expect(seen[1]!.opts).toBe(openrouterOpts);
+    expect(seen[1]!.opts.headers).toEqual({ "x-existing": "keep" });
+  });
+
+  it("derives attribution from each call's session, never a cached one", () => {
+    const { fallback, seen } = captureFallback();
+    const bridge = createBridgeStreamFn(fallback);
+    const model = { provider: "opencode-go", api: "anthropic-messages" };
+    bridge(model, "ctx", { sessionId: "first" });
+    bridge(model, "ctx", { sessionId: "second" });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]!.opts.headers["x-opencode-session"]).toBe("first");
+    expect(seen[1]!.opts.headers["x-opencode-session"]).toBe("second");
+  });
+
+  it("never mutates the caller's opts object", () => {
+    const { fallback, seen } = captureFallback();
+    const bridge = createBridgeStreamFn(fallback);
+    const opts = { headers: { "x-existing": "keep" }, sessionId: "sess-1" };
+    const snapshot = JSON.parse(JSON.stringify(opts));
+    bridge({ provider: "opencode-go", api: "anthropic-messages" }, "ctx", opts);
+    expect(opts).toEqual(snapshot);
+    expect(seen[0]!.opts).not.toBe(opts);
   });
 });

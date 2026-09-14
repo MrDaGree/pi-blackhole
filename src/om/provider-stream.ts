@@ -139,18 +139,6 @@ export function withProviderAttributionHeaders(
   return { ...headers, ...attribution };
 }
 
-/**
- * Back-compat alias for PR #95 (`withOpenCodeSessionHeaders`). Identical
- * behavior; prefer `withProviderAttributionHeaders` for new code.
- */
-export function withOpenCodeSessionHeaders(
-  model: { provider?: unknown; baseUrl?: unknown } | null | undefined,
-  headers: Record<string, string> | undefined,
-  sessionId: string | undefined,
-): Record<string, string> | undefined {
-  return withProviderAttributionHeaders(model, headers, sessionId);
-}
-
 /** Minimal `transformHeaders` shape (pi-ai `ModelsRequestTransforms`). */
 export type AttributionTransform = (
   headers: Record<string, string>,
