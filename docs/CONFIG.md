@@ -180,6 +180,8 @@ Only applies when `compaction: "auto"` and `compactionEngine: "blackhole"`.
 
 `"pause"` is intentionally different: it calls public `ctx.compact()`, which aborts the active run by design. That abort may propagate to extensions which treat the run signal as user cancellation, so use `"resume"` for transparent/subagent workflows.
 
+**Headless sessions (subagents, flow runners).** In-memory sessions (`SessionManager.inMemory()`) are typically disposed by their parent right after `agent_end`, so the deferred `agent_end` compaction reliably loses that race and bails on a stale extension ctx — under `"off"` such sessions are effectively never compacted ([#92](https://github.com/k0valik/pi-blackhole/issues/92)). Every skipped compaction is counted and surfaced: the `/blackhole-memory` status shows `Skipped compactions (disposed ctx): N`, and each affected session warns once (UI notification, or stderr for headless runs).
+
 **Re-trigger safety:** after a successful compaction, accumulated tokens are counted from the fresh compaction entry. Failed or cancelled attempts are suspended until pressure drops below the threshold.
 
 ```jsonc

@@ -24,6 +24,38 @@ function isStaleExtensionContextError(error: unknown): boolean {
   return message.includes("extension ctx is stale") || message.includes("ctx is stale");
 }
 
+/** Cap for the per-session stale-skip warn set (bounds memory on long-lived
+ * processes hosting many subagent sessions). Oldest warnings are forgotten
+ * when the cap is hit, allowing a re-warn for those sessions. */
+export const STALE_SKIP_WARN_MAX_SESSIONS = 100;
+
+/** Record a scheduled auto-compaction that was skipped because the extension
+ * ctx went stale before the deferred microtask could run (issue #92).
+ * Always bumps the process-wide counter; warns once per session — via the UI
+ * when one exists, console.warn otherwise (headless sessions have no other
+ * channel). */
+export function recordStaleCtxSkip(
+  runtime: {
+    staleCtxSkippedCompactions?: number;
+    staleCtxWarnedSessions?: Set<string>;
+  },
+  hasUI: boolean,
+  ui: { notify: (message: string, level: string) => void } | undefined,
+  sessionId: string,
+): void {
+  runtime.staleCtxSkippedCompactions = (runtime.staleCtxSkippedCompactions ?? 0) + 1;
+  const warned = (runtime.staleCtxWarnedSessions ??= new Set<string>());
+  if (warned.has(sessionId)) return;
+  if (warned.size >= STALE_SKIP_WARN_MAX_SESSIONS) warned.clear();
+  warned.add(sessionId);
+  const message =
+    `Observational memory: auto-compaction skipped — the extension ctx went stale before the deferred ` +
+    `compaction ran (in-memory sessions disposed right after agent_end lose this race); ` +
+    `see /blackhole status`;
+  notifySafely(hasUI, ui, message, "warning");
+  if (!hasUI) console.warn(message);
+}
+
 function notifySafely(
   hasUI: boolean,
   ui: any,
@@ -472,6 +504,7 @@ function handleAgentEnd(event: any, ctx: any, runtime: Runtime): void {
             runtime.compactInFlight = false;
             runtime.autoCompactionController = null;
             dbg("compaction_trigger.microtask.bail", { reason: "stale_ctx" });
+            recordStaleCtxSkip(runtime, hasUI, ui, sessionId);
             return;
           }
           throw error;
@@ -588,6 +621,7 @@ function handleAgentEnd(event: any, ctx: any, runtime: Runtime): void {
           reason: "stale_ctx",
           message: msg,
         });
+        recordStaleCtxSkip(runtime, hasUI, ui, sessionId);
         return;
       }
       dbg("compaction_trigger.microtask.error", { message: msg });

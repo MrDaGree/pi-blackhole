@@ -14,8 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   recordMidRunFailure,
+  recordStaleCtxSkip,
   registerCompactionTrigger,
   resetMidRunRetry,
+  STALE_SKIP_WARN_MAX_SESSIONS,
 } from "../src/om/compaction-trigger.js";
 import {
   InlineCompactionUnavailableError,
@@ -115,6 +117,8 @@ function captureHandler(
     midRunCompactionRetry: { failures: 0, retryAfter: 0 },
     inlineCompactionAdapterStatus: undefined as { supported: boolean; reason?: string } | undefined,
     inlineCompactionWarningEmitted: false,
+    staleCtxSkippedCompactions: 0,
+    staleCtxWarnedSessions: new Set<string>(),
   };
   registerCompactionTrigger(pi as any, runtime as any, inlineCompact);
   if (!agentEndHandler) throw new Error("agent_end handler was not registered");
@@ -310,6 +314,120 @@ describe("V3 compaction trigger (blackhole)", () => {
 
     expect(runtime.compactInFlight).toBe(false);
     expect(ctx.compact).not.toHaveBeenCalled();
+    // Issue #92: the bail must be counted and surfaced, not silent.
+    expect(runtime.staleCtxSkippedCompactions).toBe(1);
+    // (ui also received the info-level threshold notice; only one warning)
+    const warns = ctx.ui.notify.mock.calls.filter((call) => call[1] === "warning");
+    expect(warns).toHaveLength(1);
+    expect(warns[0][0]).toContain("auto-compaction skipped");
+  });
+
+  describe("stale-ctx skip surfacing (issue #92)", () => {
+    /** Ctx whose scheduling getSessionId succeeds, then the deferred loop's
+     * check throws stale. */
+    function staleThenThrow(id: string) {
+      const ctx = fakeCtx([dueBranch]);
+      ctx.sessionManager.getSessionId = vi
+        .fn()
+        .mockReturnValueOnce(id)
+        .mockImplementation(() => {
+          throw new Error("This extension ctx is stale after session replacement or reload.");
+        });
+      return ctx;
+    }
+
+    const warningCalls = (ctx: ReturnType<typeof fakeCtx>) =>
+      (ctx.ui as any).notify.mock.calls.filter((call: unknown[]) => call[1] === "warning");
+
+    it("warns once per session across repeated stale-ctx bails", async () => {
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+
+      const first = staleThenThrow("test-session-001");
+      handler(agentEnd(), first);
+      await flushAll();
+      const second = staleThenThrow("test-session-001");
+      handler(agentEnd(), second);
+      await flushAll();
+
+      expect(runtime.staleCtxSkippedCompactions).toBe(2);
+      expect(warningCalls(first)).toHaveLength(1);
+      expect(warningCalls(second)).toHaveLength(0);
+    });
+
+    it("warns again for a different session id", async () => {
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+
+      const first = staleThenThrow("test-session-001");
+      handler(agentEnd(), first);
+      await flushAll();
+      const second = staleThenThrow("test-session-002");
+      handler(agentEnd(), second);
+      await flushAll();
+
+      expect(runtime.staleCtxSkippedCompactions).toBe(2);
+      expect(warningCalls(first)).toHaveLength(1);
+      expect(warningCalls(second)).toHaveLength(1);
+    });
+
+    it("counts and warns on the outer-catch stale path (isIdle throws stale)", async () => {
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+      const ctx = fakeCtx([dueBranch]);
+      ctx.isIdle = vi.fn(() => {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      });
+
+      handler(agentEnd(), ctx);
+      await flushAll();
+
+      expect(runtime.staleCtxSkippedCompactions).toBe(1);
+      expect(ctx.compact).not.toHaveBeenCalled();
+    });
+
+    it("headless stale bails use console.warn and never ui.notify", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+
+      try {
+        const ctx = fakeCtx([dueBranch], { hasUI: false, ui: { notify: vi.fn() } });
+        ctx.sessionManager.getSessionId = vi
+          .fn()
+          .mockReturnValueOnce("test-session-001")
+          .mockImplementation(() => {
+            throw new Error("This extension ctx is stale after session replacement or reload.");
+          });
+
+        handler(agentEnd(), ctx);
+        await flushAll();
+
+        expect(runtime.staleCtxSkippedCompactions).toBe(1);
+        expect((ctx.ui as any).notify).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy.mock.calls[0][0]).toContain("auto-compaction skipped");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("bounds the warned-session set", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const runtime: any = {
+        staleCtxSkippedCompactions: 0,
+        staleCtxWarnedSessions: new Set<string>(),
+      };
+
+      try {
+        for (let i = 0; i < STALE_SKIP_WARN_MAX_SESSIONS + 1; i += 1) {
+          recordStaleCtxSkip(runtime, false, undefined, `session-${i}`);
+        }
+
+        expect(runtime.staleCtxSkippedCompactions).toBe(STALE_SKIP_WARN_MAX_SESSIONS + 1);
+        expect(runtime.staleCtxWarnedSessions.size).toBeLessThanOrEqual(
+          STALE_SKIP_WARN_MAX_SESSIONS,
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   it("aborts the wait loop when the session changes mid-wait (e.g. /resume)", async () => {

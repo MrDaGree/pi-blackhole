@@ -170,6 +170,15 @@ export class Runtime {
   inlineCompactionAdapterStatus?: { supported: boolean; reason?: string };
   /** One-shot guard for the settled-fallback user notification. */
   inlineCompactionWarningEmitted = false;
+  /** Count of scheduled auto-compactions skipped because the extension ctx went
+   * stale before the deferred microtask could run — typically in-memory
+   * subagent/flow sessions disposed right after `agent_end` (issue #92).
+   * Process-wide: nested sessions share this runtime, so the parent's
+   * /blackhole-memory status surfaces child-session skips. */
+  staleCtxSkippedCompactions = 0;
+  /** Session ids already warned about a stale-ctx skip (warn once per session,
+   * bounded — see STALE_SKIP_WARN_MAX_SESSIONS). */
+  staleCtxWarnedSessions: Set<string> = new Set();
   resolveFailureNotified = false;
   lastObserverError: string | undefined;
   lastReflectorError: string | undefined;
