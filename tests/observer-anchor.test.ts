@@ -11,7 +11,7 @@
 import { describe, test, expect, vi, beforeEach } from "vitest";
 
 import { Runtime } from "../src/om/runtime.js";
-import { runObserverStage, type ConsolidationCtx } from "../src/om/consolidation.js";
+import { anyStageDue, runObserverStage, type ConsolidationCtx } from "../src/om/consolidation.js";
 import { OM_OBSERVATIONS_RECORDED } from "../src/om/ledger/types.js";
 import type { Entry } from "@earendil-works/pi-ai";
 
@@ -109,8 +109,80 @@ describe("runObserverStage anchor (issue #87)", () => {
 
     expect(outcome).toBe("continue");
     expect(runObserverSpy).not.toHaveBeenCalled();
-    // Not-due path still advances the cursor past the backlog.
-    expect(runtime.getCursor("observer")?.state).toBe("not_due");
+    // The below-threshold entry stays unobserved: with nothing measured yet the
+    // stage must not create a cursor that hides it from later checks.
+    expect(runtime.getCursor("observer")).toBeUndefined();
+  });
+
+  test("small additions accumulate until the observer threshold is reached", async () => {
+    const runtime = makeRuntime(100);
+    const entries: Entry[] = [];
+    for (let i = 0; i < 6 && runObserverSpy.mock.calls.length === 0; i += 1) {
+      entries.push(messageEntry(`small-${i}`, `SMALL-SENTINEL-${i} ${"x".repeat(110)}`));
+      await runStage(runtime, entries);
+    }
+
+    expect(runObserverSpy).toHaveBeenCalledTimes(1);
+    const arg = runObserverSpy.mock.calls[0]![0] as { chunk: string };
+    // The first addition is only ~32 tokens; it must still be observed once the
+    // accumulated total crosses the threshold.
+    expect(arg.chunk).toContain("SMALL-SENTINEL-0");
+  });
+
+  test("keeps unobserved content when another due stage launches the pipeline", async () => {
+    const runtime = makeRuntime(100);
+    runtime.config.reflectAfterTokens = 1;
+    const marker: Entry = {
+      type: "custom",
+      customType: OM_OBSERVATIONS_RECORDED,
+      id: "m1",
+      data: {
+        coversUpToId: "old1",
+        observations: [{ content: "prior observation" }],
+      },
+    } as unknown as Entry;
+    const first = [
+      messageEntry("old1", "OLD-COVERED"),
+      marker,
+      messageEntry("new1", "NEW-UNOBSERVED"),
+    ];
+
+    // The reflector is due, so the pipeline launches although the observer is not.
+    expect(anyStageDue(first, runtime, undefined)).toBe(true);
+    await runStage(runtime, first);
+    expect(runObserverSpy).not.toHaveBeenCalled();
+
+    const second = [...first, messageEntry("new2", text("BIG-ADDITION"))];
+    await runStage(runtime, second);
+
+    expect(runObserverSpy).toHaveBeenCalledTimes(1);
+    const arg = runObserverSpy.mock.calls[0]![0] as { chunk: string };
+    expect(arg.chunk).toContain("NEW-UNOBSERVED");
+    expect(arg.chunk).toContain("BIG-ADDITION");
+  });
+
+  test("does not re-observe the same entries after an empty observer outcome", async () => {
+    const entries = [messageEntry("e1", text("ONLY-CHUNK"))];
+    const runtime = makeRuntime(100);
+
+    await runStage(runtime, entries);
+    expect(runObserverSpy).toHaveBeenCalledTimes(1);
+    expect(runtime.getCursor("observer")?.state).toBe("empty");
+
+    await runStage(runtime, entries);
+    expect(runObserverSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("falls back to the full history when the observer cursor entry no longer exists", async () => {
+    const runtime = makeRuntime(100);
+    runtime.advanceCursor("observer", "missing-entry", "recorded");
+    const entries = [messageEntry("e1", text("STALE-FALLBACK"))];
+
+    await runStage(runtime, entries);
+
+    expect(runObserverSpy).toHaveBeenCalledTimes(1);
+    const arg = runObserverSpy.mock.calls[0]![0] as { chunk: string };
+    expect(arg.chunk).toContain("STALE-FALLBACK");
   });
 
   test("observer still anchors to the last compaction entry when one exists", async () => {

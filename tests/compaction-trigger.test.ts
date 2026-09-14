@@ -1465,4 +1465,70 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
 
     expect(ctx.compact).toHaveBeenCalledTimes(1);
   });
+
+  it("skips a session whose own host helper reports ineligible while another host is eligible", async () => {
+    class IneligibleHostSession extends TriggerTestSession {}
+    class EligibleHostSession extends TriggerTestSession {}
+    const ineligiblePrepare = vi.fn(() => undefined);
+    const eligiblePrepare = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    installInlineCompactionAdapter({
+      sessionClass: IneligibleHostSession as never,
+      hostPrepareCompaction: ineligiblePrepare,
+    });
+    installInlineCompactionAdapter({
+      sessionClass: EligibleHostSession as never,
+      hostPrepareCompaction: eligiblePrepare,
+    });
+
+    const eligibleSession = new EligibleHostSession(() => makeLargeBranch(), {});
+    eligibleSession._bindExtensionCore({});
+    const ineligibleSession = new IneligibleHostSession(() => makeLargeBranch(), {});
+    ineligibleSession._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: ineligibleSession.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    await flushAll();
+
+    expect(ctx.compact).not.toHaveBeenCalled();
+    expect(runtime.compactInFlight).toBe(false);
+    expect(ineligiblePrepare).toHaveBeenCalledTimes(1);
+    expect(eligiblePrepare).not.toHaveBeenCalled();
+  });
+
+  it("compacts a session whose own host helper reports eligible", async () => {
+    class IneligibleHostSession extends TriggerTestSession {}
+    class EligibleHostSession extends TriggerTestSession {}
+    const ineligiblePrepare = vi.fn(() => undefined);
+    const eligiblePrepare = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    installInlineCompactionAdapter({
+      sessionClass: IneligibleHostSession as never,
+      hostPrepareCompaction: ineligiblePrepare,
+    });
+    installInlineCompactionAdapter({
+      sessionClass: EligibleHostSession as never,
+      hostPrepareCompaction: eligiblePrepare,
+    });
+
+    const eligibleSession = new EligibleHostSession(() => makeLargeBranch(), {});
+    eligibleSession._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: eligibleSession.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    expect(runtime.compactInFlight).toBe(true);
+    await flushAll();
+
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(eligiblePrepare).toHaveBeenCalled();
+    expect(ineligiblePrepare).not.toHaveBeenCalled();
+  });
 });

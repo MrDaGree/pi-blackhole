@@ -189,6 +189,9 @@ function hostSessionSource(summary: string): string {
       buildSessionContext: () => ({ messages: [] }),
       appendCompaction: () => {},
     };
+    this.settingsManager = {
+      getCompactionSettings: () => ({ enabled: true, reserveTokens: 1000, keepRecentTokens: 20000 }),
+    };
   }
   async abort() {}
   _bindExtensionCore() {}
@@ -199,6 +202,46 @@ function hostSessionSource(summary: string): string {
     return { summary: "${summary}", firstKeptEntryId: "kept", tokensBefore: 1 };
   }
 }`;
+}
+
+interface HostFixture {
+  barrel: string;
+  cli: string;
+  frame: string;
+}
+
+/**
+ * Synthetic host package with a resolvable `prepareCompaction` module. The
+ * `eligibleForCompaction` flag is the per-host sentinel: one host's helper
+ * reports a preparation, the other's reports none.
+ */
+async function makeHostFixture(
+  fixtureRoot: string,
+  name: string,
+  options: { eligibleForCompaction: boolean },
+): Promise<HostFixture> {
+  const packageRoot = join(fixtureRoot, name, "node_modules", "@earendil-works", "pi-coding-agent");
+  const dist = join(packageRoot, "dist");
+  await mkdir(join(dist, "core", "compaction"), { recursive: true });
+  await writeFile(join(packageRoot, "package.json"), HOST_MANIFEST);
+  await writeFile(join(dist, "index.js"), hostSessionSource(`${name}-summary`));
+  await writeFile(
+    join(dist, "core", "compaction", "index.js"),
+    options.eligibleForCompaction
+      ? 'export function prepareCompaction(entries) { return { firstKeptEntryId: entries[0]?.id ?? "entry-1" }; }\n'
+      : "export function prepareCompaction() { return undefined; }\n",
+  );
+  const cli = join(dist, "cli.js");
+  const frame = join(dist, "frame.js");
+  await Promise.all([writeFile(cli, ""), writeFile(frame, "")]);
+  return { barrel: join(dist, "index.js"), cli, frame };
+}
+
+interface FixtureSessionClass {
+  new (): {
+    _bindExtensionCore(runner: unknown): void;
+    sessionManager: object;
+  };
 }
 
 describe("Blackhole inline compaction adapter", () => {
@@ -732,6 +775,78 @@ describe("Blackhole inline compaction adapter", () => {
       expect(status.supported).toBe(false);
       expect(status.reason).toContain(`${join(dist, "main.js")}: AgentSession export missing`);
       expect(status.reason).toContain(`${join(dist, "index.js")}: AgentSession export missing`);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("binds each host's preparation helper to the sessions captured from that host", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-host-prepare-"));
+    try {
+      const ineligible = await makeHostFixture(fixtureRoot, "ineligible", {
+        eligibleForCompaction: false,
+      });
+      const eligible = await makeHostFixture(fixtureRoot, "eligible", {
+        eligibleForCompaction: true,
+      });
+      const ineligibleModule = (await import(pathToFileURL(ineligible.barrel).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+      const eligibleModule = (await import(pathToFileURL(eligible.barrel).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+
+      // Stack frame first, then entrypoint: the ineligible host resolves first.
+      await expect(
+        installHostInlineCompactionAdapter({
+          entrypoint: eligible.cli,
+          stack: `Error\n    at first (${ineligible.frame}:1:1)`,
+        }),
+      ).resolves.toEqual({ supported: true });
+
+      const ineligibleSession = new ineligibleModule.AgentSession();
+      ineligibleSession._bindExtensionCore({});
+      const eligibleSession = new eligibleModule.AgentSession();
+      eligibleSession._bindExtensionCore({});
+
+      expect(isCompactionEligible(ineligibleSession.sessionManager, [])).toBe(false);
+      expect(isCompactionEligible(eligibleSession.sessionManager, [])).toBe(true);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("binds host helpers correctly when the entrypoint host resolves first", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "blackhole-host-prepare-reversed-"));
+    try {
+      const eligible = await makeHostFixture(fixtureRoot, "eligible", {
+        eligibleForCompaction: true,
+      });
+      const ineligible = await makeHostFixture(fixtureRoot, "ineligible", {
+        eligibleForCompaction: false,
+      });
+      const eligibleModule = (await import(pathToFileURL(eligible.barrel).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+      const ineligibleModule = (await import(pathToFileURL(ineligible.barrel).href)) as {
+        AgentSession: FixtureSessionClass;
+      };
+
+      // Entrypoint host (ineligible) resolves second; the stack host resolves first.
+      await expect(
+        installHostInlineCompactionAdapter({
+          entrypoint: ineligible.cli,
+          stack: `Error\n    at first (${eligible.frame}:1:1)`,
+        }),
+      ).resolves.toEqual({ supported: true });
+
+      const eligibleSession = new eligibleModule.AgentSession();
+      eligibleSession._bindExtensionCore({});
+      const ineligibleSession = new ineligibleModule.AgentSession();
+      ineligibleSession._bindExtensionCore({});
+
+      expect(isCompactionEligible(ineligibleSession.sessionManager, [])).toBe(false);
+      expect(isCompactionEligible(eligibleSession.sessionManager, [])).toBe(true);
     } finally {
       await rm(fixtureRoot, { recursive: true, force: true });
     }

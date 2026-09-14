@@ -673,9 +673,11 @@ export async function runObserverStage(
   // rawTokensAfterIndex clamps -1 to index 0 (issue #87).
   const tokens = rawTokensAfterIndex(entries, effectiveStart);
   if (tokens < runtime.config.observeAfterTokens) {
-    // Not due — advance cursor to last source entry so we don't re-check immediately
-    const lastSourceId = [...entries].reverse().find((e: Entry) => isSourceEntry(e))?.id;
-    if (lastSourceId) runtime.advanceCursor("observer", lastSourceId, "not_due");
+    // Not due. Keep the anchor at the measured coverage point rather than the
+    // newest entry: below-threshold content is still unobserved, so moving the
+    // cursor past it would drop it permanently instead of letting it accumulate.
+    const anchorId = effectiveStart >= 0 ? entries[effectiveStart]?.id : undefined;
+    if (anchorId) runtime.advanceCursor("observer", anchorId, "not_due");
     return "continue";
   }
 

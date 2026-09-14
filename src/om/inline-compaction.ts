@@ -76,16 +76,27 @@ interface CompactShape {
   disconnectsAgent: boolean;
 }
 
+/**
+ * Marks an installation as belonging to one resolved host. Its presence means
+ * "use this host's helper, even if it exposes none" so a session can never
+ * borrow the helper of a different host.
+ */
+interface HostPrepareBinding {
+  prepareCompaction?: PrepareCompactionLike;
+}
+
 interface InstalledAdapter {
   status: InlineCompactionAdapterStatus;
   originalCompact?: PatchableSession["compact"];
   shape?: CompactShape;
+  hostBinding?: HostPrepareBinding;
 }
 
 interface SessionRecord {
   session: PatchableSession;
   originalCompact: PatchableSession["compact"];
   shape: CompactShape;
+  hostBinding?: HostPrepareBinding;
 }
 
 interface AdapterRegistry {
@@ -109,6 +120,14 @@ export interface InlineCompactionAdapterStatus {
 export interface InlineCompactionInstallOptions {
   sessionClass?: PatchableSessionClass;
   prepareCompaction?: PrepareCompactionLike;
+  /**
+   * Preparation helper resolved for the same host as `sessionClass`. When the
+   * property is present, sessions captured from this class bind to it —
+   * including an explicit `undefined`, meaning that host exposes none — so the
+   * session never borrows another host's helper. Omit the property to keep the
+   * shared `prepareCompaction` behavior.
+   */
+  hostPrepareCompaction?: PrepareCompactionLike;
 }
 
 export interface HostInlineCompactionInstallOptions {
@@ -382,6 +401,14 @@ function registerSession(
     return;
   }
 
+  const previous = registry.sessions.get(session.sessionManager);
+  if (previous?.hostBinding) {
+    // The innermost patch already bound this session to its own host. A broader
+    // (usually inherited) patch must not replace that host binding.
+    installNextTurnRefresh(session, registry);
+    return;
+  }
+
   if (!registry.sessions.has(session.sessionManager)) {
     registry.capturedSessionCount = (registry.capturedSessionCount ?? 0) + 1;
   }
@@ -389,6 +416,7 @@ function registerSession(
     session,
     originalCompact: installed.originalCompact,
     shape: installed.shape,
+    hostBinding: installed.hostBinding,
   });
   installNextTurnRefresh(session, registry);
 }
@@ -473,15 +501,22 @@ function findBundledRuntimeModule(entrypoint: string, packageRoot: string): stri
   return undefined;
 }
 
+/**
+ * Resolve the host's `prepareCompaction` once per package root. The shared
+ * registry entry keeps the single-host diagnostics contract; the returned map
+ * lets each installed host bind the helper it actually owns.
+ */
 async function resolveHostPrepareCompaction(
   packageRoots: Iterable<string>,
   registry: AdapterRegistry,
-): Promise<void> {
-  if (registry.prepareCompaction && registry.prepareCompactionSource !== "injected") return;
-
+): Promise<Map<string, PrepareCompactionLike | undefined>> {
+  const byRoot = new Map<string, PrepareCompactionLike | undefined>();
   const failureReasons: string[] = [];
   let attemptedPaths = false;
+  let firstResolved: { prepare: PrepareCompactionLike; source: string } | undefined;
+
   for (const packageRoot of packageRoots) {
+    let resolvedForRoot: PrepareCompactionLike | undefined;
     for (const subpath of [
       join("dist", "core", "compaction", "index.js"),
       join("dist", "core", "compaction", "compaction.js"),
@@ -494,14 +529,9 @@ async function resolveHostPrepareCompaction(
             prepareCompaction?: PrepareCompactionLike;
           };
           if (typeof compModule.prepareCompaction === "function") {
-            registry.prepareCompaction = compModule.prepareCompaction;
-            registry.prepareCompactionSource = fullPath;
-            registry.prepareCompactionFailure = undefined;
-            debugLog("inline_compaction.prepare_compaction", {
-              resolved: true,
-              source: fullPath,
-            });
-            return;
+            resolvedForRoot = compModule.prepareCompaction;
+            firstResolved ??= { prepare: resolvedForRoot, source: fullPath };
+            break;
           }
           failureReasons.push(`${fullPath}: prepareCompaction is not a function`);
         } catch (error) {
@@ -511,6 +541,23 @@ async function resolveHostPrepareCompaction(
         }
       }
     }
+    byRoot.set(packageRoot, resolvedForRoot);
+  }
+
+  if (registry.prepareCompaction && registry.prepareCompactionSource !== "injected") {
+    // A real host helper is already recorded; keep its diagnostics untouched.
+    return byRoot;
+  }
+
+  if (firstResolved) {
+    registry.prepareCompaction = firstResolved.prepare;
+    registry.prepareCompactionSource = firstResolved.source;
+    registry.prepareCompactionFailure = undefined;
+    debugLog("inline_compaction.prepare_compaction", {
+      resolved: true,
+      source: firstResolved.source,
+    });
+    return byRoot;
   }
 
   const failure =
@@ -524,6 +571,7 @@ async function resolveHostPrepareCompaction(
     resolved: false,
     failure,
   });
+  return byRoot;
 }
 
 export async function installHostInlineCompactionAdapter(
@@ -549,7 +597,7 @@ export async function installHostInlineCompactionAdapter(
     registry.prepareCompactionFailure = undefined;
   }
 
-  await resolveHostPrepareCompaction(packageRoots, registry);
+  const prepareByRoot = await resolveHostPrepareCompaction(packageRoots, registry);
 
   // Fast candidates first: per package root, pi's already-loaded bundled
   // runtime chunk (cache-hit, ~0-10ms). A resolved chunk path only proves the
@@ -587,6 +635,10 @@ export async function installHostInlineCompactionAdapter(
 
       const status = installInlineCompactionAdapter({
         sessionClass: hostModule.AgentSession,
+        hostPrepareCompaction:
+          "prepareCompaction" in options
+            ? options.prepareCompaction
+            : prepareByRoot.get(packageRoot),
       });
       if (status.supported) {
         supportedStatus ??= status;
@@ -638,8 +690,15 @@ export function installInlineCompactionAdapter(
     registry.prepareCompactionSource = options.prepareCompaction ? "injected" : undefined;
     registry.prepareCompactionFailure = undefined;
   }
+  const hostBinding =
+    "hostPrepareCompaction" in options
+      ? { prepareCompaction: options.hostPrepareCompaction }
+      : undefined;
   const existing = registry.installs.get(prototype);
-  if (existing) return existing.status;
+  if (existing) {
+    if (hostBinding) existing.hostBinding = hostBinding;
+    return existing.status;
+  }
 
   const shape = detectCompactShape(prototype);
   if (typeof shape === "string") {
@@ -654,6 +713,7 @@ export function installInlineCompactionAdapter(
     status: { supported: true },
     originalCompact,
     shape,
+    hostBinding,
   };
 
   prototype._bindExtensionCore = function patchedBindExtensionCore(
@@ -874,7 +934,13 @@ export function isCompactionEligible(
   entries: unknown[],
   customSettings?: CompactionSettingsLike,
 ): boolean {
-  const prepare = getRegistry().prepareCompaction;
+  const registry = getRegistry();
+  const record = registry.sessions.get(sessionManager);
+  // A host-bound session uses the helper resolved for its own host — never the
+  // helper another discovered host happened to resolve first.
+  const prepare = record?.hostBinding
+    ? record.hostBinding.prepareCompaction
+    : registry.prepareCompaction;
   if (typeof prepare !== "function") {
     // Unknown host capability: do not permanently disable compaction.
     return true;
