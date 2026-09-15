@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- **Minimum supported Pi raised to 0.84.3.** The `compat-min-supported` CI job now derives its pin from the `peerDependencies` floor instead of a hardcoded version, so the floor only moves when new Pi APIs are adopted. Fail-closed behavior on older hosts is unchanged.
+
 ### Fixed
 
 - **OM workers now send provider-required session headers (OpenCode Go `MissingSessionID`).** Observer/reflector/dropper calls bypass Pi's interactive header pipeline (`mergeProviderAttributionHeaders` + `before_provider_headers` in `sdk.ts`) by invoking `streamSimple` directly, so the OpenCode Go gateway rejected every worker request with `400 MissingSessionID` while Pi's own calls worked. Attribution now happens at a single choke point (`withProviderAttributionHeaders`, pi-core `getSessionHeaders` mirror with exact-hostname matching): the Pi session id travels through standard stream options (`sessionId`) and is materialized both as pre-merged `headers` and as a composed `transformHeaders` (honored by pi-ai `applyAuth` after the auth merge), covering builtin, custom-registered, and future providers without per-stage branching. Reworks PR #95 with the contributor's regression assertions kept verbatim. ([#93](https://github.com/k0valik/pi-blackhole/issues/93))
