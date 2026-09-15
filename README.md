@@ -31,13 +31,13 @@ Then `/reload` or restart Pi. The config file at `~/.pi/agent/pi-blackhole/pi-bl
 
 ## ✨ What's new
 
-> **Latest release: [0.5.4](CHANGELOG.md)**
+> **Latest release: [0.5.5](CHANGELOG.md)**
 >
-> - **Recall responses are now budget-bounded** — one knob (`recallResponseMaxChars`, default 48k chars ≈ 12k tokens) caps search snippets, expansions, and related observations; clipped content stays reachable via the new `#N:text` drill-down and `page:N` continuation. `/blackhole-recall` itself stays uncapped (human TUI output). ([#83](https://github.com/k0valik/pi-blackhole/issues/83))
-> - **Compaction summaries now speak recall's index space** — `(#N)` refs are session-global, so they resolve to the right operation after compactions and branches instead of pointing at unrelated history. ([#82](https://github.com/k0valik/pi-blackhole/issues/82))
-> - **Memory that curates for a future session** — rebuilt observer/reflector/dropper prompts (survival test, grounding rules, noise exclusions) plus observation timestamps derived from cited evidence instead of model-typed dates.
-> - **Observer fires before the first compaction** — a never-compacted session (fresh start, fork, subagent) no longer stays at zero observations forever; the observer runs as soon as the token threshold is hit. ([#87](https://github.com/k0valik/pi-blackhole/issues/87))
-> - **Auto-compaction no longer errors on "session too small"** — proactive triggers pre-check Pi's own compaction eligibility instead of notice-spamming and throwing.
+> - **Custom-provider memory workers fixed** — observer/reflector/dropper requests now carry Pi's session headers, so gateways that require them (OpenCode `MissingSessionID`) stop rejecting every worker call. ([#93](https://github.com/k0valik/pi-blackhole/issues/93))
+> - **Deterministic provider errors cool down into fallbacks** — bad credentials, unknown models, and other 4xx failures stop burning retries on the broken model and fall through to `*FallbackModels` instead.
+> - **Skipped subagent compactions are now visible** — in-memory sessions disposed before deferred compaction now count (`Skipped compactions (disposed ctx)` in `/blackhole-memory` status) and warn once per session instead of failing silently. ([#92](https://github.com/k0valik/pi-blackhole/issues/92))
+> - **Mid-run compaction works on unbundled Pi installs** — per-root host discovery plus per-host helper binding, so the inline path no longer stays silently unavailable. ([#96](https://github.com/k0valik/pi-blackhole/issues/96))
+> - **Minimum supported Pi is 0.84.3**, and the compat CI job now tracks the `peerDependencies` floor instead of a hardcoded version.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
