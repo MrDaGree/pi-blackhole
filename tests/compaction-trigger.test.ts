@@ -9,12 +9,15 @@
  *   - Skipped "does not await observer/reflect promises" test (not applicable)
  */
 import { join } from "node:path";
+import type { CompactionResult } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   recordMidRunFailure,
+  recordStaleCtxSkip,
   registerCompactionTrigger,
   resetMidRunRetry,
+  STALE_SKIP_WARN_MAX_SESSIONS,
 } from "../src/om/compaction-trigger.js";
 import {
   InlineCompactionUnavailableError,
@@ -114,6 +117,8 @@ function captureHandler(
     midRunCompactionRetry: { failures: 0, retryAfter: 0 },
     inlineCompactionAdapterStatus: undefined as { supported: boolean; reason?: string } | undefined,
     inlineCompactionWarningEmitted: false,
+    staleCtxSkippedCompactions: 0,
+    staleCtxWarnedSessions: new Set<string>(),
   };
   registerCompactionTrigger(pi as any, runtime as any, inlineCompact);
   if (!agentEndHandler) throw new Error("agent_end handler was not registered");
@@ -309,6 +314,120 @@ describe("V3 compaction trigger (blackhole)", () => {
 
     expect(runtime.compactInFlight).toBe(false);
     expect(ctx.compact).not.toHaveBeenCalled();
+    // Issue #92: the bail must be counted and surfaced, not silent.
+    expect(runtime.staleCtxSkippedCompactions).toBe(1);
+    // (ui also received the info-level threshold notice; only one warning)
+    const warns = ctx.ui.notify.mock.calls.filter((call) => call[1] === "warning");
+    expect(warns).toHaveLength(1);
+    expect(warns[0][0]).toContain("auto-compaction skipped");
+  });
+
+  describe("stale-ctx skip surfacing (issue #92)", () => {
+    /** Ctx whose scheduling getSessionId succeeds, then the deferred loop's
+     * check throws stale. */
+    function staleThenThrow(id: string) {
+      const ctx = fakeCtx([dueBranch]);
+      ctx.sessionManager.getSessionId = vi
+        .fn()
+        .mockReturnValueOnce(id)
+        .mockImplementation(() => {
+          throw new Error("This extension ctx is stale after session replacement or reload.");
+        });
+      return ctx;
+    }
+
+    const warningCalls = (ctx: ReturnType<typeof fakeCtx>) =>
+      (ctx.ui as any).notify.mock.calls.filter((call: unknown[]) => call[1] === "warning");
+
+    it("warns once per session across repeated stale-ctx bails", async () => {
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+
+      const first = staleThenThrow("test-session-001");
+      handler(agentEnd(), first);
+      await flushAll();
+      const second = staleThenThrow("test-session-001");
+      handler(agentEnd(), second);
+      await flushAll();
+
+      expect(runtime.staleCtxSkippedCompactions).toBe(2);
+      expect(warningCalls(first)).toHaveLength(1);
+      expect(warningCalls(second)).toHaveLength(0);
+    });
+
+    it("warns again for a different session id", async () => {
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+
+      const first = staleThenThrow("test-session-001");
+      handler(agentEnd(), first);
+      await flushAll();
+      const second = staleThenThrow("test-session-002");
+      handler(agentEnd(), second);
+      await flushAll();
+
+      expect(runtime.staleCtxSkippedCompactions).toBe(2);
+      expect(warningCalls(first)).toHaveLength(1);
+      expect(warningCalls(second)).toHaveLength(1);
+    });
+
+    it("counts and warns on the outer-catch stale path (isIdle throws stale)", async () => {
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+      const ctx = fakeCtx([dueBranch]);
+      ctx.isIdle = vi.fn(() => {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      });
+
+      handler(agentEnd(), ctx);
+      await flushAll();
+
+      expect(runtime.staleCtxSkippedCompactions).toBe(1);
+      expect(ctx.compact).not.toHaveBeenCalled();
+    });
+
+    it("headless stale bails use console.warn and never ui.notify", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+
+      try {
+        const ctx = fakeCtx([dueBranch], { hasUI: false, ui: { notify: vi.fn() } });
+        ctx.sessionManager.getSessionId = vi
+          .fn()
+          .mockReturnValueOnce("test-session-001")
+          .mockImplementation(() => {
+            throw new Error("This extension ctx is stale after session replacement or reload.");
+          });
+
+        handler(agentEnd(), ctx);
+        await flushAll();
+
+        expect(runtime.staleCtxSkippedCompactions).toBe(1);
+        expect((ctx.ui as any).notify).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy.mock.calls[0][0]).toContain("auto-compaction skipped");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("bounds the warned-session set", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const runtime: any = {
+        staleCtxSkippedCompactions: 0,
+        staleCtxWarnedSessions: new Set<string>(),
+      };
+
+      try {
+        for (let i = 0; i < STALE_SKIP_WARN_MAX_SESSIONS + 1; i += 1) {
+          recordStaleCtxSkip(runtime, false, undefined, `session-${i}`);
+        }
+
+        expect(runtime.staleCtxSkippedCompactions).toBe(STALE_SKIP_WARN_MAX_SESSIONS + 1);
+        expect(runtime.staleCtxWarnedSessions.size).toBeLessThanOrEqual(
+          STALE_SKIP_WARN_MAX_SESSIONS,
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   it("aborts the wait loop when the session changes mid-wait (e.g. /resume)", async () => {
@@ -1025,6 +1144,58 @@ describe("inline adapter classification", () => {
     ok.startHandler(undefined, fakeCtx([belowBranch]));
     expect(ok.runtime.config.midRunCompaction).toBe("resume");
   });
+  it("loads config at agent_start before deciding on the resume warning", () => {
+    const { startHandler, runtime } = captureHandler({});
+    // First run: no config loaded yet — only ensureConfig can supply the mode.
+    runtime.config.midRunCompaction = undefined;
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    runtime.ensureConfig = vi.fn((cwd: string) => {
+      expect(cwd).toBe("/tmp/project");
+      runtime.config.midRunCompaction = "resume";
+    });
+    const ctx = fakeCtx([belowBranch]);
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.ensureConfig).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify.mock.calls[0][0]).toContain("pi lacks API");
+    expect(ctx.ui.notify.mock.calls[0][1]).toBe("warning");
+  });
+
+  it("stays silent at agent_start when the loaded config is not resume", () => {
+    const { startHandler, runtime } = captureHandler({});
+    runtime.config.midRunCompaction = undefined;
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    runtime.ensureConfig = vi.fn(() => {
+      runtime.config.midRunCompaction = "pause";
+    });
+    const ctx = fakeCtx([belowBranch]);
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.ensureConfig).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("marks the warning emitted without notifying when the ctx has no UI", () => {
+    const { startHandler, runtime } = captureHandler({ midRunCompaction: "resume" });
+    runtime.inlineCompactionAdapterStatus = {
+      supported: false,
+      reason: "pi lacks API",
+    };
+    const ctx = fakeCtx([belowBranch], { hasUI: false, ui: undefined });
+
+    startHandler(undefined, ctx);
+
+    expect(runtime.inlineCompactionWarningEmitted).toBe(true);
+  });
 });
 
 describe("Context-window-derived threshold (issue #60)", () => {
@@ -1197,6 +1368,7 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
       buildSessionContext: () => { messages: unknown[] };
       getBranch: () => TestEntry[];
       getSessionId: () => string;
+      appendCompaction?: () => void;
     };
     agent = { state: { messages: [] } };
 
@@ -1218,10 +1390,11 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
       };
     }
 
-    async compact() {
+    async compact(): Promise<CompactionResult> {
       await this.abort();
-      (this as any).sessionManager.appendCompaction?.();
+      this.sessionManager.appendCompaction?.();
       this.agent.state.messages = [];
+      return { summary: "trigger-test-summary", firstKeptEntryId: "kept-1", tokensBefore: 1 };
     }
 
     async abort() {}
@@ -1412,5 +1585,139 @@ describe("Eligibility guard (proactive auto-compaction Nothing to compact / sess
     await flushAll();
 
     expect(ctx.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a session whose own host helper reports ineligible while another host is eligible", async () => {
+    class IneligibleHostSession extends TriggerTestSession {}
+    class EligibleHostSession extends TriggerTestSession {}
+    const ineligiblePrepare = vi.fn(() => undefined);
+    const eligiblePrepare = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    installInlineCompactionAdapter({
+      sessionClass: IneligibleHostSession,
+      hostPrepareCompaction: ineligiblePrepare,
+    });
+    installInlineCompactionAdapter({
+      sessionClass: EligibleHostSession,
+      hostPrepareCompaction: eligiblePrepare,
+    });
+
+    const eligibleSession = new EligibleHostSession(() => makeLargeBranch(), {});
+    eligibleSession._bindExtensionCore({});
+    const ineligibleSession = new IneligibleHostSession(() => makeLargeBranch(), {});
+    ineligibleSession._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: ineligibleSession.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    await flushAll();
+
+    expect(ctx.compact).not.toHaveBeenCalled();
+    expect(runtime.compactInFlight).toBe(false);
+    expect(ineligiblePrepare).toHaveBeenCalledTimes(1);
+    expect(eligiblePrepare).not.toHaveBeenCalled();
+  });
+
+  it("compacts a session whose own host helper reports eligible", async () => {
+    class IneligibleHostSession extends TriggerTestSession {}
+    class EligibleHostSession extends TriggerTestSession {}
+    const ineligiblePrepare = vi.fn(() => undefined);
+    const eligiblePrepare = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    installInlineCompactionAdapter({
+      sessionClass: IneligibleHostSession,
+      hostPrepareCompaction: ineligiblePrepare,
+    });
+    installInlineCompactionAdapter({
+      sessionClass: EligibleHostSession,
+      hostPrepareCompaction: eligiblePrepare,
+    });
+
+    const eligibleSession = new EligibleHostSession(() => makeLargeBranch(), {});
+    eligibleSession._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: eligibleSession.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    expect(runtime.compactInFlight).toBe(true);
+    await flushAll();
+
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(eligiblePrepare).toHaveBeenCalled();
+    expect(ineligiblePrepare).not.toHaveBeenCalled();
+  });
+
+  it("compacts for a replacement session that reuses the previous session manager", async () => {
+    class ReusedManagerSession extends TriggerTestSession {}
+    const ineligibleReplace = vi.fn(() => undefined);
+    const eligibleReplace = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+
+    // Both installs target one class: the replacement session shares its
+    // manager with the previous session, exactly like a resumed Pi session.
+    installInlineCompactionAdapter({
+      sessionClass: ReusedManagerSession,
+      hostPrepareCompaction: ineligibleReplace,
+    });
+    const previous = new ReusedManagerSession(() => makeLargeBranch(), {});
+    previous._bindExtensionCore({});
+    const replacement = new ReusedManagerSession(() => makeLargeBranch(), {});
+    replacement.sessionManager = previous.sessionManager;
+    replacement._bindExtensionCore({});
+
+    installInlineCompactionAdapter({
+      sessionClass: ReusedManagerSession,
+      hostPrepareCompaction: eligibleReplace,
+    });
+    replacement._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], {
+      sessionManager: replacement.sessionManager,
+    });
+
+    handler(agentEnd(), ctx);
+    expect(runtime.compactInFlight).toBe(true);
+    await flushAll();
+
+    expect(ctx.compact).toHaveBeenCalledTimes(1);
+    expect(eligibleReplace).toHaveBeenCalled();
+    expect(ineligibleReplace).not.toHaveBeenCalled();
+  });
+
+  it("skips a replacement session whose refreshed host helper reports ineligible", async () => {
+    class RefreshedHostSession extends TriggerTestSession {}
+    const eligibleInitially = vi.fn(() => ({ firstKeptEntryId: "entry-1" }));
+    const refreshedIneligible = vi.fn(() => undefined);
+
+    installInlineCompactionAdapter({
+      sessionClass: RefreshedHostSession,
+      hostPrepareCompaction: eligibleInitially,
+    });
+    const session = new RefreshedHostSession(() => makeLargeBranch(), {});
+    session._bindExtensionCore({});
+
+    // A reload re-installs the adapter with the host's current helper.
+    installInlineCompactionAdapter({
+      sessionClass: RefreshedHostSession,
+      hostPrepareCompaction: refreshedIneligible,
+    });
+    session._bindExtensionCore({});
+
+    const { handler, runtime } = captureHandler({ compactAfterTokens: 81_000 });
+    const ctx = fakeCtx([makeLargeBranch()], { sessionManager: session.sessionManager });
+
+    handler(agentEnd(), ctx);
+    await flushAll();
+
+    expect(ctx.compact).not.toHaveBeenCalled();
+    expect(runtime.compactInFlight).toBe(false);
+    expect(refreshedIneligible).toHaveBeenCalledTimes(1);
+    expect(eligibleInitially).not.toHaveBeenCalled();
   });
 });
