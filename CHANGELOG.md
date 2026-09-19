@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- **Observer preamble cap now applies in auto/off compaction modes.** `observerPreambleMaxTokens` was previously only enforced in manual mode, so auto-mode observer prompts could grow without bound even though the main session prompt stayed capped by `observationsPoolMaxTokens`; the observer now applies the same relevance-ranked selection budget in all modes, defaulting to 30% of `observerChunkMaxTokens` when unset.
+
 ---
 
 ## [0.5.6] - 2026-09-19

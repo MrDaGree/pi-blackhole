@@ -698,11 +698,18 @@ export async function runObserverStage(
   let priorReflections = memory.reflections.map(reflectionToSummaryLine);
   let priorObservations = memory.observations.map(observationToSummaryLine);
 
-  // In manual mode, append accumulated batch history to whatever
-  // fullProjection found in the branch (preserving pre-switch markers
-  // when transitioning from autoCompact to manual mode mid-session).
   // The preamble is capped via observerPreambleMaxTokens so accumulated
-  // observations don't grow unbounded across turns.
+  // observations don't grow unbounded across turns. In manual mode, append
+  // accumulated batch history to whatever fullProjection found in the branch
+  // (preserving pre-switch markers when transitioning from autoCompact to
+  // manual mode mid-session).
+  const preambleMaxTokens =
+    runtime.config.observerPreambleMaxTokens > 0
+      ? runtime.config.observerPreambleMaxTokens
+      : Math.round(runtime.config.observerChunkMaxTokens * 0.3);
+  priorObservations = selectPriorObservations(memory.observations, preambleMaxTokens).map(
+    observationToSummaryLine,
+  );
   if (isManualMode(runtime.config)) {
     const pendingCtx = readPendingState(sessionId);
     const accumulatedReflections = (pendingCtx.reflectionBatches ?? []).flatMap(
@@ -712,11 +719,6 @@ export async function runObserverStage(
       (b) => (b.data as any).observations ?? [],
     );
 
-    // Capped preamble: high always kept, medium/low scored by relevance + recency
-    const preambleMaxTokens =
-      runtime.config.observerPreambleMaxTokens > 0
-        ? runtime.config.observerPreambleMaxTokens
-        : Math.round(runtime.config.observerChunkMaxTokens * 0.3);
     const allObservations = [...memory.observations, ...accumulatedObservations];
     priorObservations = selectPriorObservations(allObservations, preambleMaxTokens).map(
       observationToSummaryLine,

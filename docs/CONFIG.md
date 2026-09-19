@@ -459,7 +459,7 @@ Max source-entry tokens sent to the observer per chunk.
 
 ### `observerPreambleMaxTokens`
 
-Max preamble tokens (`CURRENT REFLECTIONS` / `OBSERVATIONS`) in the observer prompt. Default `0` means auto-compute from `observerChunkMaxTokens` (30%). Only applied in `noAutoCompact` mode where accumulated batch history can grow unbounded.
+Max preamble tokens (`CURRENT REFLECTIONS` / `OBSERVATIONS`) in the observer prompt. Default `0` means auto-compute from `observerChunkMaxTokens` (30%). Applied in both auto/manual compaction modes so the observer prompt does not grow without bound as the session accumulates observations.
 
 | Type | Default |
 |------|---------|
