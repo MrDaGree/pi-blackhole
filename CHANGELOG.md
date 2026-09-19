@@ -4,6 +4,10 @@
 
 ## [0.5.6] - 2026-09-19
 
+### Added
+
+- **Pre-compaction output stays visible after compaction** ([#103](https://github.com/k0valik/pi-blackhole/pull/103), thanks @sonSunnoi). After a successful Blackhole compaction, the newest assistant text removed from view is re-rendered as a display-only **Previous output — display only** block, so recent work stays readable without opening `/tree`. Bounded and opt-out: 16 KiB UTF-8 cap with a truncation marker, text only (no tool output, thinking, or images), idempotent per compaction, skipped when the newest dropped text is retained; disabled via `showPreCompactionMessage` (default `true`, env `PI_BLACKHOLE_SHOW_PRE_COMPACTION_MESSAGE`).
+
 ### Changed
 
 - **Minimum supported Pi raised to 0.85.1; compat-floor CI retired.** The `compat-min-supported` job re-pinned the `@earendil-works/*` peers to the `peerDependencies` floor and typechecked against them, going red every time. The extension now builds against the pinned devDependencies (0.85.1) and the peer floor is set to match; `peerDependencies` remains the single source of truth for the declared minimum.
