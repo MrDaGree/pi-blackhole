@@ -37,6 +37,7 @@ Then `/reload` or restart Pi. The config file at `~/.pi/agent/pi-blackhole/pi-bl
 > - **`[Files And Changes]` and `[Commits]` extract what actually happened** — file attribution correlates tool calls with results instead of guessing from a hardcoded tool list, and commit capture understands real-world flag orders and heredocs. ([#105](https://github.com/k0valik/pi-blackhole/issues/105))
 > - **Observer chunks always respect `maxTokens`** — `custom_message` entries (previously zero-counted) are now sized like every other entry. ([#110](https://github.com/k0valik/pi-blackhole/issues/110))
 > - **`[Files And Changes]` display and cross-compaction merge overhauled** — cwd-relative paths, capped lists that never shrink, and `(#N)` drill-down refs.
+> - **Pre-compaction output stays visible after compaction** — the newest assistant text dropped by compaction re-renders as a display-only block (16 KiB cap, text only), so recent work stays readable without opening `/tree`. Opt out via `showPreCompactionMessage`. ([#103](https://github.com/k0valik/pi-blackhole/pull/103))
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
