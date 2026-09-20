@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- **Footer status bar.** pi-blackhole now shows live state in the pi footer (config key `statusBar`, default on; env `PI_BLACKHOLE_STATUSBAR`): three token gauges — O (transcript since the last observer run), P (observation pool fill), X (context since the last compaction) — plus worker spinners, `✓ +N` completion events, and compaction notes with their trigger reason. Gauges color by fill: dim under 80%, theme warning color from 80%, theme error color at 100%. The bar reads in-process state (`runtime.config`, `model-budget.ts`, `ledger/progress.ts`, `runtime.consolidationPhase`), so its numbers match `/blackhole-memory` status; it adds no file polling and no threshold guessing, only a 1-second in-process poll of the runtime state. If you ran the standalone `blackhole-status.ts` footer extension before, remove it: two writers on the same `setStatus` key race.
+
 ### Fixed
 
 - **Observer preamble cap now applies in auto/off compaction modes.** `observerPreambleMaxTokens` was previously only enforced in manual mode, so auto-mode observer prompts could grow without bound even though the main session prompt stayed capped by `observationsPoolMaxTokens`; the observer now applies the same relevance-ranked selection budget in all modes, defaulting to 30% of `observerChunkMaxTokens` when unset.
